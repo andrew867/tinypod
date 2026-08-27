@@ -1,0 +1,16 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: make TARGET=host -j$(nproc)
+      - name: unit
+        run: make test
+      - name: fixtures
+        run: |
+          ./out/host/tinypod --mount tests/fixtures/sqlite-itdb-small --backend null libcheck
+          ./out/host/tinypod --mount tests/fixtures/raw-files-small --backend null libcheck
+          ./out/host/tinypod --mount tests/fixtures/malformed-db --backend null libcheck
