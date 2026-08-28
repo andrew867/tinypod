@@ -19,3 +19,7 @@ testdata/real-ipod-full/
 out/
 build/
 tinypod
+
+# Fetched by tools/fetch-decoders.sh (RealNetworks RPSL/RCSL, not ours to vendor)
+/third_party/helix-aac/
+/third_party/helix-mp3/

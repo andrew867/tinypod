@@ -29,6 +29,23 @@ enum tp_player_state tp_player_state(struct tp_player *p);
 const char *tp_player_backend_name(enum tp_player_backend b);
 enum tp_player_backend tp_player_backend_from_name(const char *name);
 
+/*
+ * Block until the current track finishes, fails, or is stopped. Returns 0 if
+ * it played to the end. The CLI needs this - without it "tinypod play" exits
+ * the moment playback starts and takes the audio with it.
+ */
+int tp_player_wait(struct tp_player *p);
+
+/* Progress and format of the track being played. Zero when idle. */
+unsigned long tp_player_position_ms(struct tp_player *p);
+unsigned long tp_player_duration_ms(struct tp_player *p);
+int tp_player_rate(struct tp_player *p);
+int tp_player_channels(struct tp_player *p);
+const char *tp_player_codec(struct tp_player *p);
+/* Empty unless the last playback attempt failed. */
+const char *tp_player_last_error(struct tp_player *p);
+const char *tp_player_current_title(struct tp_player *p);
+
 /* Queue helpers used by app */
 struct tp_play_queue {
     uint64_t *ids;

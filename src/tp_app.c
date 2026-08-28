@@ -1,4 +1,6 @@
 #include "tp_app.h"
+#include "tp_decode.h"
+#include "tp_sink.h"
 #include "tp_util.h"
 #include "tp_log.h"
 #include "tp_path.h"
@@ -338,12 +340,95 @@ int tp_app_cmd_shuffle(struct tp_app *app)
     return 0;
 }
 
+static const char *state_name(enum tp_player_state st)
+{
+    switch (st) {
+    case TP_PLAYER_PLAYING: return "playing";
+    case TP_PLAYER_PAUSED: return "paused";
+    default: return "stopped";
+    }
+}
+
 int tp_app_cmd_status(struct tp_app *app)
 {
+    enum tp_player_state st = tp_player_state(app->player);
+    unsigned long pos = tp_player_position_ms(app->player);
+    unsigned long dur = tp_player_duration_ms(app->player);
+    const char *err;
+
     printf("backend: %s\n", tp_player_backend_name(app->backend));
-    printf("state: %d\n", (int)tp_player_state(app->player));
+    printf("state: %s\n", state_name(st));
+    if (st != TP_PLAYER_STOPPED) {
+        const char *codec = tp_player_codec(app->player);
+        printf("track: %s\n", tp_player_current_title(app->player));
+        if (codec && codec[0])
+            printf("format: %s %d Hz %d ch\n", codec, tp_player_rate(app->player),
+                   tp_player_channels(app->player));
+        printf("position: %lu:%02lu", pos / 60000ul, (pos / 1000ul) % 60ul);
+        if (dur)
+            printf(" / %lu:%02lu", dur / 60000ul, (dur / 1000ul) % 60ul);
+        printf("\n");
+    }
     printf("shuffle: %s\n", app->cfg.shuffle ? "on" : "off");
     if (app->cfg.last_track_id)
         printf("last_track_id: %llu\n", (unsigned long long)app->cfg.last_track_id);
+    err = tp_player_last_error(app->player);
+    if (err && err[0])
+        printf("last_error: %s\n", err);
     return 0;
+}
+
+/*
+ * Decode straight to a WAV file. This is how playback gets verified without a
+ * speaker: same decoder the ALSA backend runs, output somewhere it can be
+ * inspected, so a decode fault can be told apart from an audio-device fault.
+ */
+int tp_app_cmd_decode(struct tp_app *app, const char *path, const char *out)
+{
+    struct tp_dec *dec;
+    struct tp_sink *sink;
+    int16_t *block;
+    char err[256] = "";
+    unsigned long long total = 0;
+    int n;
+
+    (void)app;
+
+    dec = tp_dec_open(path, err, sizeof(err));
+    if (!dec) {
+        tp_error("Cannot decode this file.\n  %s\n  %s", path, err);
+        return 1;
+    }
+    block = malloc(sizeof(int16_t) * TP_DEC_MAX_BLOCK);
+    if (!block) {
+        tp_dec_close(dec);
+        return 1;
+    }
+    sink = tp_sink_open_wav(out, tp_dec_rate(dec), tp_dec_channels(dec), err, sizeof(err));
+    if (!sink) {
+        tp_error("%s", err);
+        free(block);
+        tp_dec_close(dec);
+        return 1;
+    }
+
+    while ((n = tp_dec_read(dec, block)) > 0) {
+        if (tp_sink_write(sink, block, n) != 0) {
+            tp_error("write to %s failed", out);
+            break;
+        }
+        total += (unsigned long long)n;
+    }
+
+    printf("%s: %s %d Hz %d ch, %llu samples (%.2f s) -> %s\n", path,
+           tp_dec_codec_name(dec), tp_dec_rate(dec), tp_dec_channels(dec), total,
+           tp_dec_channels(dec) && tp_dec_rate(dec)
+               ? (double)total / tp_dec_channels(dec) / tp_dec_rate(dec)
+               : 0.0,
+           out);
+
+    tp_sink_close(sink);
+    free(block);
+    tp_dec_close(dec);
+    return n < 0 ? 1 : 0;
 }

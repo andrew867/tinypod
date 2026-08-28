@@ -21,8 +21,10 @@ static void usage(void)
             "  export-m3u        M3U playlist on stdout\n"
             "  play <track-id>   Play by track id\n"
             "  play --file PATH  Play a file directly\n"
+            "  decode IN OUT.wav Decode a file to WAV (no audio device needed)\n"
             "  pause|resume|stop|next|prev|shuffle|status\n"
             "  ui                Framebuffer UI (if available)\n\n"
+            "play blocks until the track ends; --no-wait returns immediately.\n"
             "Mount: --mount PATH or TINYPOD_MOUNT. On N31, auto-detects /mnt/disk.\n");
 }
 
@@ -33,6 +35,7 @@ int main(int argc, char **argv)
 {
     const char *mount = NULL;
     const char *backend_name = NULL;
+    int no_wait = 0;
     enum tp_player_backend backend;
     struct tp_app app;
     int i = 1;
@@ -44,6 +47,8 @@ int main(int argc, char **argv)
             mount = argv[++i];
         } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
             backend_name = argv[++i];
+        } else if (strcmp(argv[i], "--no-wait") == 0) {
+            no_wait = 1;
         } else if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "--verbose") == 0) {
             tp_log_set_level(TP_LOG_DEBUG);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -67,6 +72,41 @@ int main(int argc, char **argv)
     backend = tp_player_backend_from_name(backend_name);
 
     cmd = (i < argc) ? argv[i++] : "scan";
+
+    /*
+     * decode works on a single file and never touches the library, so it must
+     * not need a mounted volume: it is the way to check a file decodes when
+     * the iPod is not attached, or when there is no audio device at all.
+     */
+    if (strcmp(cmd, "decode") == 0) {
+        if (i + 1 >= argc) {
+            usage();
+            return 2;
+        }
+        return tp_app_cmd_decode(NULL, argv[i], argv[i + 1]);
+    }
+
+    /*
+     * Likewise "play --file": one named file, no library lookup. This is how
+     * a track gets played straight off the disk before the FTL mount is up.
+     */
+    if (strcmp(cmd, "play") == 0 && i + 1 < argc && strcmp(argv[i], "--file") == 0) {
+        struct tp_player *pl = tp_player_create(backend);
+
+        if (!pl)
+            return 1;
+        rc = tp_player_play_file(pl, argv[i + 1]) == 0 ? 0 : 1;
+        if (rc == 0 && !no_wait && backend != TP_PLAYER_NULL) {
+            if (tp_player_wait(pl) != 0) {
+                const char *e = tp_player_last_error(pl);
+                if (e && e[0])
+                    fprintf(stderr, "playback stopped: %s\n", e);
+                rc = 1;
+            }
+        }
+        tp_player_destroy(pl);
+        return rc;
+    }
 
     if (tp_app_init(&app, mount, backend) != 0)
         return 1;
@@ -92,14 +132,28 @@ int main(int argc, char **argv)
     } else if (strcmp(cmd, "export-m3u") == 0) {
         rc = tp_app_cmd_export_m3u(&app, stdout);
     } else if (strcmp(cmd, "play") == 0) {
-        if (i < argc && strcmp(argv[i], "--file") == 0 && i + 1 < argc) {
-            rc = tp_app_cmd_play_file(&app, argv[i + 1]);
-        } else if (i < argc) {
+        if (i < argc) {
             uint64_t id = strtoull(argv[i], NULL, 10);
             rc = tp_app_cmd_play_id(&app, id);
-            if (rc == 0 && backend == TP_PLAYER_EXTERNAL) {
-                /* wait until child exits for CLI friendliness on short tests skip */
+        } else {
+            usage();
+            rc = 2;
+        }
+        /*
+         * Teardown stops playback, so returning here would end the track the
+         * instant it started. Hold until it finishes unless asked not to.
+         */
+        if (rc == 0 && !no_wait && backend != TP_PLAYER_NULL) {
+            if (tp_player_wait(app.player) != 0) {
+                const char *e = tp_player_last_error(app.player);
+                if (e && e[0])
+                    fprintf(stderr, "playback stopped: %s\n", e);
+                rc = 1;
             }
+        }
+    } else if (strcmp(cmd, "decode") == 0) {
+        if (i + 1 < argc) {
+            rc = tp_app_cmd_decode(&app, argv[i], argv[i + 1]);
         } else {
             usage();
             rc = 2;

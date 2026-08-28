@@ -10,6 +10,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/select.h>
+#include <sys/time.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -33,6 +35,7 @@ struct ui_state {
     enum ui_screen screen;
     int sel;
     int running;
+    int was_playing;   /* to spot a track ending by itself */
 };
 
 static void draw_term(struct ui_state *ui)
@@ -50,7 +53,7 @@ static void draw_term(struct ui_state *ui)
         printf("  %s Now Playing\n", ui->sel == 5 ? ">" : " ");
         printf("  %s Settings\n", ui->sel == 6 ? ">" : " ");
         printf("  %s About\n", ui->sel == 7 ? ">" : " ");
-        printf("\nVol+/j/k move  Enter select  q/Back quit\n");
+        printf("\nj/k move  Enter select  p pause  n next  b prev  x stop  q back\n");
         break;
     case UI_SONGS:
         printf("Songs (%zu)\n", ui->app->lib.track_count);
@@ -106,8 +109,9 @@ static void activate(struct ui_state *ui)
         case 4:
             ui->app->cfg.shuffle = 1;
             tp_queue_from_library(&ui->app->queue, &ui->app->lib, 1);
-            if (ui->app->queue.count)
-                tp_app_cmd_play_id(ui->app, ui->app->queue.ids[0]);
+            if (ui->app->queue.count &&
+                tp_app_cmd_play_id(ui->app, ui->app->queue.ids[0]) == 0)
+                ui->was_playing = 1;
             ui->screen = UI_NOW;
             break;
         case 5: ui->screen = UI_NOW; break;
@@ -116,14 +120,16 @@ static void activate(struct ui_state *ui)
         }
     } else if (ui->screen == UI_SONGS && ui->app->lib.track_count) {
         size_t idx = (size_t)ui->sel;
-        if (idx < ui->app->lib.track_count)
-            tp_app_cmd_play_id(ui->app, ui->app->lib.tracks[idx].track_id);
+        if (idx < ui->app->lib.track_count &&
+            tp_app_cmd_play_id(ui->app, ui->app->lib.tracks[idx].track_id) == 0)
+            ui->was_playing = 1;
         ui->screen = UI_NOW;
     } else if (ui->screen == UI_PLAYLISTS && ui->app->lib.playlist_count) {
         size_t idx = (size_t)ui->sel;
         if (idx < ui->app->lib.playlist_count &&
-            ui->app->lib.playlists[idx].track_count > 0)
-            tp_app_cmd_play_id(ui->app, ui->app->lib.playlists[idx].track_ids[0]);
+            ui->app->lib.playlists[idx].track_count > 0 &&
+            tp_app_cmd_play_id(ui->app, ui->app->lib.playlists[idx].track_ids[0]) == 0)
+            ui->was_playing = 1;
         ui->screen = UI_NOW;
     }
 }
@@ -169,8 +175,42 @@ int tp_ui_fb_run(struct tp_app *app)
     while (ui.running) {
         int c;
         int mx;
+        enum tp_player_state st;
+        fd_set rfds;
+        struct timeval tv;
+        unsigned char ch;
+
         draw_term(&ui);
-        c = getchar();
+
+        /*
+         * Playback runs on its own thread, so the UI must not sit in a
+         * blocking read: it has to keep the clock moving on Now Playing and
+         * notice when a track ends so the next one can start.
+         */
+        FD_ZERO(&rfds);
+        FD_SET(STDIN_FILENO, &rfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 500000;
+        if (select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv) <= 0) {
+            st = tp_player_state(app->player);
+            if (ui.was_playing && st == TP_PLAYER_STOPPED) {
+                ui.was_playing = 0;
+                /* Ended on its own - roll on to the next queued track. */
+                if (app->queue.count > 0 && tp_app_cmd_next(app) == 0)
+                    ui.was_playing = 1;
+            } else if (st == TP_PLAYER_PLAYING) {
+                ui.was_playing = 1;
+            }
+            continue;
+        }
+        if (read(STDIN_FILENO, &ch, 1) != 1)
+            continue;
+        c = ch;
+
+        st = tp_player_state(app->player);
+        if (st == TP_PLAYER_PLAYING)
+            ui.was_playing = 1;
+
         if (c == 'q' || c == 27) {
             if (ui.screen == UI_HOME)
                 ui.running = 0;
@@ -198,6 +238,13 @@ int tp_ui_fb_run(struct tp_app *app)
                 tp_app_cmd_resume(app);
         } else if (c == 'n') {
             tp_app_cmd_next(app);
+            ui.was_playing = 1;
+        } else if (c == 'b') {
+            tp_app_cmd_prev(app);
+            ui.was_playing = 1;
+        } else if (c == 'x') {
+            tp_app_cmd_stop(app);
+            ui.was_playing = 0;   /* a deliberate stop must not auto-advance */
         }
     }
 

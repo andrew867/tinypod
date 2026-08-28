@@ -36,6 +36,7 @@ int tp_app_cmd_next(struct tp_app *app);
 int tp_app_cmd_prev(struct tp_app *app);
 int tp_app_cmd_shuffle(struct tp_app *app);
 int tp_app_cmd_status(struct tp_app *app);
+int tp_app_cmd_decode(struct tp_app *app, const char *path, const char *out);
 int tp_app_cmd_search(struct tp_app *app, const char *q);
 void tp_app_print_banner(struct tp_app *app);
 

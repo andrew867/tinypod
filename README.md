@@ -18,16 +18,30 @@ No database rebuild required.
 - Falls back to `iTunesCDB` / classic `iTunesDB`, then raw `Music/Fxx` + tags
 - Never writes under `iPod_Control`
 - CLI + optional terminal/framebuffer UI
-- Playback backends: `null`, `external` (mpv/ffplay/mpg123), `alsa` (N31)
+- **Decodes in-process**: Helix fixed-point AAC (incl. HE-AAC/SBR) and MP3, plus
+  WAV. No mpv, no ffmpeg, no helper process - the N31 initramfs has none.
+- Its own MP4/M4A demuxer, so iTunes-synced `.m4a` files play as they are
+- Playback backends: `alsa` (N31, decodes in-process), `external` (a dev host's
+  mpv/ffplay/mplayer/cvlc/mpg123), `null` (resolve only)
 
 ## Build (WSL / Linux)
 
 ```sh
 cd tinypod
-make                # host ELF → out/host/tinypod
-make test           # unit selftest
-make TARGET=n31     # musl-static ARMv7 (needs arm-linux-musleabi-gcc)
+./tools/fetch-decoders.sh   # third_party/helix-aac, helix-mp3 (also run by make)
+make                        # host ELF -> out/host/tinypod
+make test                   # unit selftest
+make TARGET=n31 TINYALSA_DIR=/path/to/tinyalsa-2.0.0   # musl-static ARMv7
 ```
+
+The decoders are RealNetworks Helix (RPSL/RCSL), so they are fetched at build
+time rather than vendored: see [tools/fetch-decoders.sh](tools/fetch-decoders.sh)
+to point the build at different sources. Fixed point is the requirement - the
+N31 is armv7 soft-float, where a floating-point decoder spends its time
+emulating floats.
+
+In the ipod tree, `tools/linux-n31/build-n31-tinypod.sh` does all of the above
+and stages the binary for the initramfs and the disk.
 
 ## Run
 
@@ -35,7 +49,14 @@ make TARGET=n31     # musl-static ARMv7 (needs arm-linux-musleabi-gcc)
 # On N31 after FTL mount:
 tinypod libcheck
 tinypod list
-tinypod play <track-id>
+tinypod play <track-id>      # decodes and plays; blocks until the track ends
+tinypod ui                   # p pause, n next, b prev, x stop, q back
+
+# Decode without an audio device - the way to tell a decode fault from a
+# sound-card fault:
+tinypod decode song.m4a /tmp/out.wav
+# Or capture what playback would have sent to the card:
+TINYPOD_ALSA_WAV=/tmp/cap.wav tinypod play <track-id>
 
 # Dev / WSL against a sample volume (path is yours — never hardcoded):
 export TINYPOD_MOUNT=/path/to/volume   # parent of iPod_Control, or iPod_Control itself
