@@ -21,8 +21,9 @@ No database rebuild required.
 - **Decodes in-process**: Helix fixed-point AAC (incl. HE-AAC/SBR) and MP3, plus
   WAV. No mpv, no ffmpeg, no helper process - the N31 initramfs has none.
 - Its own MP4/M4A demuxer, so iTunes-synced `.m4a` files play as they are
-- Playback backends: `alsa` (N31, decodes in-process), `external` (a dev host's
-  mpv/ffplay/mplayer/cvlc/mpg123), `null` (resolve only)
+- Playback backends: `alsa` (N31, decodes in-process, ALSA with an OSS
+  `/dev/dsp` fallback), `external` (a dev host's mpv/ffplay/mplayer/cvlc/
+  mpg123), `null` (resolve only)
 
 ## Build (WSL / Linux)
 

@@ -56,8 +56,21 @@ to the host build's.
 
 ## Output
 
-tinyalsa, card 0 device 0, S16_LE, 10 ms periods x 4 - the shape `n31-sine`
-proved on the glass. Override with `TINYPOD_ALSA_CARD` / `TINYPOD_ALSA_DEVICE`.
+Two paths, tried in order, because the N31 kernel can present either:
+
+1. **ALSA** via tinyalsa - card 0 device 0, S16_LE, 10 ms periods x 4, the shape
+   `n31-sine` proved on the glass. `TINYPOD_ALSA_CARD` / `TINYPOD_ALSA_DEVICE`.
+2. **OSS** on `/dev/dsp` if ALSA will not open. `TINYPOD_OSS_DEVICE`.
+
+`TINYPOD_AUDIO=alsa` or `=oss` pins one instead of falling back, and the failure
+message reports what both said rather than only the last one.
+
+The OSS path sets format, channels and rate explicitly and refuses the device if
+it answers with anything else. An unconfigured `/dev/dsp` defaults to 8 kHz 8-bit
+mono and will happily accept a 44.1 kHz stereo stream, draining it about sixty
+times too slowly - which is indistinguishable from a broken driver until you
+measure it.
+
 Playback runs on its own thread, so the UI stays responsive and pause/resume/stop
 and end-of-track auto-advance all work while audio is flowing.
 
