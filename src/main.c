@@ -1,4 +1,7 @@
 #include "tp_app.h"
+#ifdef TP_WITH_LVGL
+#include "tp_lv_ui.h"
+#endif
 #include "tp_log.h"
 #include "tp_util.h"
 
@@ -23,7 +26,8 @@ static void usage(void)
             "  play --file PATH  Play a file directly\n"
             "  decode IN OUT.wav Decode a file to WAV (no audio device needed)\n"
             "  pause|resume|stop|next|prev|shuffle|status\n"
-            "  ui                Framebuffer UI (if available)\n\n"
+            "  ui                Terminal UI\n"
+            "  gui               Graphical UI on the framebuffer\n\n"
             "play blocks until the track ends; --no-wait returns immediately.\n"
             "Mount: --mount PATH or TINYPOD_MOUNT. On N31, auto-detects /mnt/disk.\n");
 }
@@ -176,6 +180,17 @@ int main(int argc, char **argv)
         if (!app.loaded)
             tp_app_load(&app);
         rc = tp_ui_fb_run(&app);
+    } else if (strcmp(cmd, "gui") == 0) {
+#ifdef TP_WITH_LVGL
+        if (!app.loaded)
+            tp_app_load(&app);
+        rc = tp_lv_ui_run(&app, NULL);
+#else
+        fprintf(stderr,
+                "This build has no graphical UI.\n"
+                "Rebuild with UI_LVGL=1 LVGL=/path/to/lvgl, or use `ui`.\n");
+        rc = 2;
+#endif
     } else {
         fprintf(stderr, "Unknown command: %s\n", cmd);
         usage();

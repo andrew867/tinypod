@@ -50,6 +50,26 @@ WARN := -Wall -Wextra -Wpedantic -Werror
 CDEFS := -D_GNU_SOURCE -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 \
 	-DSQLITE_OMIT_DEPRECATED -DSQLITE_DQS=0
 
+# The graphical UI, off unless asked for. The core and its tests must keep
+# building with no LVGL anywhere - a UI for one device should not be able to
+# break the library reader's CI.
+#
+#   make TARGET=n31 UI_LVGL=1 LVGL=/path/to/lvgl TINYALSA_DIR=...
+#
+# The LVGL archive comes from src/ui/lvgl/Makefile.lvgl, which builds it into
+# this app's own tree. Build that first.
+UI_LVGL ?= 0
+ifeq ($(UI_LVGL),1)
+  LVGL ?= ../../NanoApps/lvgl
+  LVGL_LIB ?= src/ui/lvgl/build-$(TARGET)/liblvgl.a
+  SRC_APP += src/ui/lvgl/tp_lv_ui.c src/ui/lvgl/tp_lv_screens.c \
+	src/ui/lvgl/tp_lv_input.c
+  INCLUDES += -Isrc/ui/lvgl -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include \
+	-I$(LVGL)/include/lvgl
+  CDEFS += -DTP_WITH_LVGL=1 -DLV_CONF_INCLUDE_SIMPLE \
+	-DLV_CONF_PATH='"lv_conf_tp.h"'
+endif
+
 # tinyalsa: point at an unpacked tinyalsa tree to get real audio output.
 # Without it the build still decodes (see the "decode" command) but cannot play.
 TINYALSA_DIR ?=
@@ -67,13 +87,13 @@ ifeq ($(TARGET),n31)
   ARCH := -march=armv7-a
   CFLAGS := -Os $(ARCH) -static $(WARN) $(INCLUDES) $(CDEFS) -DTINYPOD_N31
   DECFLAGS := -O2 $(ARCH) -DARM $(INCLUDES) $(CDEFS)
-  LDFLAGS := -static $(TINYALSA_LIB) -lpthread -ldl -lm
+  LDFLAGS := -static $(TINYALSA_LIB) $(LVGL_LIB) -lpthread -ldl -lm
 else
   CC ?= gcc
   ARCH :=
   CFLAGS := -O2 -g $(WARN) $(INCLUDES) $(CDEFS)
   DECFLAGS := -O2 $(INCLUDES) $(CDEFS)
-  LDFLAGS := $(TINYALSA_LIB) -lpthread -ldl -lm
+  LDFLAGS := $(TINYALSA_LIB) $(LVGL_LIB) -lpthread -ldl -lm
 endif
 
 APP_OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRC_APP))
@@ -113,7 +133,7 @@ decoders:
 
 dirs:
 	@mkdir -p $(BUILD) $(OUT) $(BUILD)/util $(BUILD)/fs $(BUILD)/db \
-		$(BUILD)/codec $(BUILD)/playback $(BUILD)/ui \
+		$(BUILD)/codec $(BUILD)/playback $(BUILD)/ui $(BUILD)/ui/lvgl \
 		$(BUILD)/helix-aac $(BUILD)/helix-mp3 $(BUILD)/helix-mp3-real
 
 $(OUT)/tinypod: $(APP_OBJS) $(SQLITE_OBJ) $(DEC_OBJS)

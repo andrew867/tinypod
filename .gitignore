@@ -23,3 +23,7 @@ tinypod
 # Fetched by tools/fetch-decoders.sh (RealNetworks RPSL/RCSL, not ours to vendor)
 /third_party/helix-aac/
 /third_party/helix-mp3/
+
+# LVGL UI build trees and rendered screens
+src/ui/lvgl/build-*/
+src/ui/lvgl/shots/

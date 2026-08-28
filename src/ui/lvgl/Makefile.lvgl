@@ -1,0 +1,102 @@
+# TinyPod's graphical UI.
+#
+# Kept out of the main Makefile on purpose. The core builds and its CI passes
+# with no LVGL anywhere, and it should keep doing that - the graphical UI is
+# for one device, and a dependency on a checkout of LVGL should not be able to
+# break `make test` for everyone else.
+#
+#   make -f Makefile.lvgl shots     render every screen to PNG, no device
+#   make -f Makefile.lvgl n31       the ARM binary
+#
+# LVGL is not vendored here. Point at a checkout:
+#
+#   make -f Makefile.lvgl LVGL=/path/to/lvgl shots
+#
+# and it is compiled into this directory's own build tree rather than borrowed
+# from another app's, so this builds on its own.
+
+HERE      := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+TP_ROOT   ?= $(HERE)../../..
+LVGL      ?= $(TP_ROOT)/../../NanoApps/lvgl
+
+IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
+TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
+DEVICE    ?= root@192.168.7.2
+SSH_KEY   ?= $(IPOD_ROOT)/n31_id
+
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(HERE)lv_conf_tp.h\" \
+             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/include/lvgl \
+             -I$(HERE)
+
+WARN := -Wall -Wextra -Wno-unused-parameter
+
+# ---- headless preview ------------------------------------------------------
+
+HOST_BUILD := $(HERE)build-preview
+HOST_CC    ?= cc
+HOST_AR    ?= ar
+HOST_CFLAGS := -O1 -g -std=gnu99 $(WARN)
+
+HOST_LV_SRCS := $(shell find $(LVGL)/src -name '*.c' 2>/dev/null)
+HOST_LV_OBJS := $(patsubst $(LVGL)/%.c,$(HOST_BUILD)/lvgl/%.o,$(HOST_LV_SRCS))
+HOST_LVLIB   := $(HOST_BUILD)/liblvgl.a
+
+.PHONY: shots n31 push clean
+shots: $(HOST_BUILD)/preview
+	@mkdir -p $(HERE)shots
+	@cd $(HERE) && ./build-preview/preview shots
+	@cd $(HERE) && python3 $(TP_ROOT)/tools/bmp2png.py shots && rm -f shots/*.bmp
+	@ls $(HERE)shots/
+
+$(HOST_BUILD)/lvgl/%.o: $(LVGL)/%.c
+	@mkdir -p $(dir $@)
+	@$(HOST_CC) $(HOST_CFLAGS) $(LV_CFLAGS) -c -o $@ $<
+
+$(HOST_LV_OBJS): $(HERE)lv_conf_tp.h
+
+$(HOST_LVLIB): $(HOST_LV_OBJS)
+	@echo "AR $@"
+	@$(HOST_AR) rcs $@ $^
+
+$(HOST_BUILD)/preview: $(HERE)preview.c $(HERE)tp_lv_screens.c $(HOST_LVLIB)
+	@mkdir -p $(HOST_BUILD)
+	$(HOST_CC) $(HOST_CFLAGS) $(LV_CFLAGS) -o $@ \
+	    $(HERE)preview.c $(HERE)tp_lv_screens.c $(HOST_LVLIB) -lm -lpthread
+
+# ---- the device build ------------------------------------------------------
+#
+# Only the UI objects are built here; they are linked against the core objects
+# the main Makefile produces, so there is one copy of the player and the
+# library reader rather than two that can drift.
+
+ARM_BUILD  := $(HERE)build-n31
+ARM_CC     := $(TOOLCHAIN)/bin/arm-linux-musleabi-gcc
+ARM_AR     := $(TOOLCHAIN)/bin/arm-linux-musleabi-ar
+ARM_STRIP  := $(TOOLCHAIN)/bin/arm-linux-musleabi-strip
+
+ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
+ARM_CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) $(WARN) \
+              -ffunction-sections -fdata-sections
+
+ARM_LV_OBJS := $(patsubst $(LVGL)/%.c,$(ARM_BUILD)/lvgl/%.o,$(HOST_LV_SRCS))
+ARM_LVLIB   := $(ARM_BUILD)/liblvgl.a
+
+$(ARM_BUILD)/lvgl/%.o: $(LVGL)/%.c
+	@mkdir -p $(dir $@)
+	@$(ARM_CC) $(ARM_CFLAGS) $(LV_CFLAGS) -c -o $@ $<
+
+$(ARM_LV_OBJS): $(HERE)lv_conf_tp.h
+
+$(ARM_LVLIB): $(ARM_LV_OBJS)
+	@echo "AR $@"
+	@$(ARM_AR) rcs $@ $^
+
+# The archive only. The binary is linked by the main Makefile with UI_LVGL=1,
+# so there is one copy of the player and the library reader rather than two
+# builds that can drift apart.
+n31: $(ARM_LVLIB)
+	@echo "LVGL for ARM ready: $(ARM_LVLIB)"
+	@echo "now: make TARGET=n31 UI_LVGL=1 LVGL=$(LVGL) TINYALSA_DIR=..."
+
+clean:
+	rm -rf $(HOST_BUILD) $(ARM_BUILD) $(HERE)shots
