@@ -85,9 +85,18 @@ MP3R_OBJS := $(patsubst $(HELIX_MP3_DIR)/real/%.c,$(BUILD)/helix-mp3-real/%.o,$(
 # directories, or they quietly overwrite each other.
 DEC_OBJS := $(AAC_OBJS) $(MP3_OBJS) $(MP3R_OBJS)
 
-.PHONY: all clean test selftest check-real n31 host dirs tools decoders
+.PHONY: all binaries clean test selftest check-real n31 host dirs tools decoders
 
-all: decoders dirs $(OUT)/tinypod tools
+# Two passes, deliberately. SRC_AAC and SRC_MP3 are wildcards expanded when
+# this file is parsed, so on a fresh clone - where third_party is still empty -
+# they come out empty and the decoders never make it into the link, however
+# early the fetch runs. Re-entering make is what gives the wildcards a second
+# look at a directory that now has files in it.
+all:
+	@$(MAKE) --no-print-directory decoders
+	@$(MAKE) --no-print-directory binaries
+
+binaries: dirs $(OUT)/tinypod tools
 
 host:
 	$(MAKE) TARGET=host all
@@ -95,9 +104,12 @@ host:
 n31:
 	$(MAKE) TARGET=n31 all
 
+# Run directly, not through `sh`: the script needs bash (set -o pipefail) and
+# saying `sh` here overrides its shebang with whatever /bin/sh happens to be -
+# which on Ubuntu is dash, and dash has no pipefail.
 decoders:
 	@test -f $(HELIX_AAC_DIR)/aacdec.c && test -f $(HELIX_MP3_DIR)/mp3dec.c || \
-		sh tools/fetch-decoders.sh
+		./tools/fetch-decoders.sh
 
 dirs:
 	@mkdir -p $(BUILD) $(OUT) $(BUILD)/util $(BUILD)/fs $(BUILD)/db \

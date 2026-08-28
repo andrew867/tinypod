@@ -5,6 +5,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: decoders
+        run: ./tools/fetch-decoders.sh
       - name: build
         run: make TARGET=host -j$(nproc)
       - name: unit
