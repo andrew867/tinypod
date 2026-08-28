@@ -30,7 +30,8 @@ SRC_APP := \
 	src/codec/tp_decode.c \
 	src/playback/tp_player.c \
 	src/playback/tp_sink.c \
-	src/ui/tp_ui_fb.c
+	src/ui/tp_ui_fb.c \
+	src/ui/tp_ui_keys.c
 
 SRC_SQLITE := third_party/sqlite/sqlite3.c
 

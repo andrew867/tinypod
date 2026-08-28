@@ -1,5 +1,6 @@
 #include "tp_app.h"
 #include "tp_log.h"
+#include "tp_ui_keys.h"
 #include "tp_util.h"
 
 #include <fcntl.h>
@@ -150,6 +151,7 @@ int tp_ui_fb_run(struct tp_app *app)
 {
     struct ui_state ui;
     struct termios oldt, newt;
+    int have_termios = 0;
     int fb = open("/dev/fb0", O_RDWR);
     memset(&ui, 0, sizeof(ui));
     ui.app = app;
@@ -167,18 +169,18 @@ int tp_ui_fb_run(struct tp_app *app)
     }
 
     if (tcgetattr(STDIN_FILENO, &oldt) == 0) {
+        have_termios = 1;
         newt = oldt;
         newt.c_lflag &= (tcflag_t) ~(ICANON | ECHO);
         tcsetattr(STDIN_FILENO, TCSANOW, &newt);
     }
 
     while (ui.running) {
-        int c;
+        enum tp_key k;
         int mx;
         enum tp_player_state st;
         fd_set rfds;
         struct timeval tv;
-        unsigned char ch;
 
         draw_term(&ui);
 
@@ -203,52 +205,71 @@ int tp_ui_fb_run(struct tp_app *app)
             }
             continue;
         }
-        if (read(STDIN_FILENO, &ch, 1) != 1)
+        k = tp_ui_read_key(STDIN_FILENO);
+        if (k == TP_KEY_NONE)
             continue;
-        c = ch;
 
         st = tp_player_state(app->player);
         if (st == TP_PLAYER_PLAYING)
             ui.was_playing = 1;
 
-        if (c == 'q' || c == 27) {
-            if (ui.screen == UI_HOME)
+        /* Back on the home screen leaves; anywhere else it goes home. Quit
+           leaves from wherever you are. */
+        if (k == TP_KEY_QUIT || k == TP_KEY_BACK || k == TP_KEY_LEFT) {
+            if (k == TP_KEY_QUIT || ui.screen == UI_HOME) {
                 ui.running = 0;
-            else {
+            } else {
                 ui.screen = UI_HOME;
                 ui.sel = 0;
             }
             continue;
         }
+
         mx = max_sel(&ui);
         if (mx < 0)
             mx = 0;
-        if (c == 'j' || c == 's' || c == '+' ) {
+
+        switch (k) {
+        case TP_KEY_DOWN:
             if (ui.sel < mx)
                 ui.sel++;
-        } else if (c == 'k' || c == 'w' || c == '-') {
+            break;
+        case TP_KEY_UP:
             if (ui.sel > 0)
                 ui.sel--;
-        } else if (c == '\n' || c == ' ') {
+            break;
+        case TP_KEY_SELECT:
+        case TP_KEY_RIGHT:
             activate(&ui);
-        } else if (c == 'p') {
+            break;
+        case TP_KEY_PLAYPAUSE:
             if (tp_player_state(app->player) == TP_PLAYER_PLAYING)
                 tp_app_cmd_pause(app);
             else
                 tp_app_cmd_resume(app);
-        } else if (c == 'n') {
+            break;
+        case TP_KEY_NEXT:
             tp_app_cmd_next(app);
             ui.was_playing = 1;
-        } else if (c == 'b') {
+            break;
+        case TP_KEY_PREV:
             tp_app_cmd_prev(app);
             ui.was_playing = 1;
-        } else if (c == 'x') {
+            break;
+        case TP_KEY_STOP:
             tp_app_cmd_stop(app);
             ui.was_playing = 0;   /* a deliberate stop must not auto-advance */
+            break;
+        default:
+            break;
         }
     }
 
-    if (tcgetattr(STDIN_FILENO, &oldt) == 0)
+    /* Put back what was saved on the way in. Re-reading the settings here and
+       writing those back restored the raw no-echo mode we had just been using,
+       which leaves the shell with no echo and no line editing - looking for all
+       the world like it has hung. */
+    if (have_termios)
         tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
     printf("\n");
     return 0;
