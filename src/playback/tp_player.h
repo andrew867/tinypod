@@ -25,6 +25,21 @@ int tp_player_play_file(struct tp_player *p, const char *path);
 int tp_player_pause(struct tp_player *p);
 int tp_player_resume(struct tp_player *p);
 int tp_player_stop(struct tp_player *p);
+
+/*
+ * Do not wait to find out whether playback started.
+ *
+ * Normally tp_player_play_file waits a moment after starting the decode thread
+ * so that an unplayable file reports as a failure from the call rather than
+ * silently. The CLI needs that - it exits immediately afterwards, and an error
+ * discovered later would be an error nobody sees.
+ *
+ * A UI does not: it is still running, it polls the player anyway, and a fifth
+ * of a second of not redrawing is a fifth of a second of looking broken on
+ * every single track change. With this set, failures surface through
+ * tp_player_last_error() and the state returning to STOPPED.
+ */
+void tp_player_set_async(struct tp_player *p, int async);
 enum tp_player_state tp_player_state(struct tp_player *p);
 const char *tp_player_backend_name(enum tp_player_backend b);
 enum tp_player_backend tp_player_backend_from_name(const char *name);

@@ -97,6 +97,8 @@ else
 endif
 
 APP_OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRC_APP))
+# Everything but the CLI entry point, for tests that bring their own main.
+APP_OBJS_NOMAIN := $(filter-out $(BUILD)/main.o,$(APP_OBJS))
 SQLITE_OBJ := $(BUILD)/sqlite3.o
 AAC_OBJS  := $(patsubst $(HELIX_AAC_DIR)/%.c,$(BUILD)/helix-aac/%.o,$(SRC_AAC))
 MP3_OBJS  := $(patsubst $(HELIX_MP3_DIR)/%.c,$(BUILD)/helix-mp3/%.o,$(SRC_MP3))
@@ -168,7 +170,18 @@ tools: $(OUT)/tinypod
 	$(CC) $(CFLAGS) -o $(OUT)/tinypod-selftest.bin tests/unit/test_all.c \
 		$(filter-out $(BUILD)/main.o,$(APP_OBJS)) $(SQLITE_OBJ) $(DEC_OBJS) $(LDFLAGS)
 
-test selftest: all
+# Starting playback must not block the caller. It is a measurement rather than
+# an assertion, and only means anything running natively, so it is skipped when
+# cross-compiling.
+.PHONY: asynctest
+asynctest: all
+	@if [ "$(TARGET)" = host ]; then \
+	  $(CC) $(CFLAGS) -o $(OUT)/tinypod-asynctest tests/unit/test_async_start.c \
+	    $(APP_OBJS_NOMAIN) $(SQLITE_OBJ) $(DEC_OBJS) $(LDFLAGS) && \
+	  $(OUT)/tinypod-asynctest; \
+	else echo 'asynctest: host only, skipped'; fi
+
+test selftest: all asynctest
 	$(OUT)/tinypod-selftest.bin
 
 check-real: all

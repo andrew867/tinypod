@@ -319,6 +319,10 @@ static void build_filtered(enum view_kind from, int which)
     s_ui.filtered_n = n;
 }
 
+/* Defined below with the other drawing; declared here because opening a
+   track redraws before it starts playback. */
+static void draw(void);
+
 /* ---- navigation ----------------------------------------------------------- */
 
 static void push(enum view_kind kind, int filter, const char *title)
@@ -367,10 +371,20 @@ static void play_index(size_t track_index)
 
     if (track_index >= app->lib.track_count)
         return;
+
+    /*
+     * Move to Now Playing and draw it BEFORE asking for playback. Starting a
+     * track writes the config, reads the file header off NAND and joins the
+     * previous decode thread, and none of that is instant on this device - so
+     * it happens behind a screen that has already changed rather than a list
+     * that has stopped responding.
+     */
+    push(V_NOW, 0, NULL);
+    draw();
+    lv_refr_now(NULL);
+
     if (tp_app_cmd_play_id(app, app->lib.tracks[track_index].track_id) == 0)
         s_ui.was_playing = 1;
-
-    push(V_NOW, 0, NULL);
 }
 
 static void activate(void)
@@ -644,6 +658,10 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
 
     if (tp_lv_input_open() == 0)
         tp_info("no button devices - nothing can be driven");
+
+    /* This front end is still running when a track fails, so it does not need
+       playback to block while it finds out. */
+    tp_player_set_async(app->player, 1);
 
     tp_lv_screens_init();
     draw();

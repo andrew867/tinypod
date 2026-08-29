@@ -34,6 +34,7 @@ struct tp_player {
     char *current_title;
 
     /* internal decode thread */
+    int async;          /* caller will notice failures itself */
     pthread_t thread;
     pthread_mutex_t lock;
     pthread_cond_t cond;
@@ -483,7 +484,14 @@ int tp_player_play_file(struct tp_player *p, const char *path)
         /*
          * Failures surface on the thread. Give it a moment to open the file
          * and the device so an unplayable track reports here, not silently.
+         *
+         * Skipped in async mode: a UI is still running and will see the error
+         * through tp_player_last_error(), whereas waiting here would freeze it
+         * for a fifth of a second on every track change.
          */
+        if (p->async)
+            return 0;
+
         usleep(120000);
         pthread_mutex_lock(&p->lock);
         if (p->done && p->err[0]) {
@@ -594,6 +602,12 @@ int tp_player_resume(struct tp_player *p)
         return 0;
     }
     return -1;
+}
+
+void tp_player_set_async(struct tp_player *p, int async)
+{
+    if (p)
+        p->async = async;
 }
 
 int tp_player_stop(struct tp_player *p)
