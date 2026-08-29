@@ -15,6 +15,11 @@
 # and it is compiled into this directory's own build tree rather than borrowed
 # from another app's, so this builds on its own.
 
+# Stated rather than inherited from whichever rule happens to come first:
+# adding the cache-directory rule above `shots` silently made THAT the default,
+# and a bare make started reporting an empty directory as up to date.
+.DEFAULT_GOAL := shots
+
 HERE      := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 TP_ROOT   ?= $(HERE)../../..
 LVGL      ?= $(TP_ROOT)/../../NanoApps/lvgl
@@ -32,14 +37,30 @@ WARN := -Wall -Wextra -Wno-unused-parameter
 
 # ---- headless preview ------------------------------------------------------
 
+# LVGL objects on the native filesystem, keyed by the config that made them.
+#
+# A full pass is four hundred and sixty-six translation units. Written through
+# to the Windows drive that measured twelve minutes wall for four and a half of
+# CPU - the rest was filesystem. Naming the directory after the config hash also
+# means a branch switch, which rewrites lv_conf and moves its mtime without
+# changing a byte, reuses the objects instead of rebuilding them.
+LV_CONF_ID := $(shell md5sum $(HERE)lv_conf_tp.h 2>/dev/null | cut -c1-12)
+LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/tinypod-$(LV_CONF_ID)
+
+$(LV_CACHE):
+	@mkdir -p $@
+
+# ccache when it is there, nothing when it is not.
+CCACHE := $(shell command -v ccache 2>/dev/null)
+
 HOST_BUILD := $(HERE)build-preview
-HOST_CC    ?= cc
+HOST_CC    ?= $(CCACHE) cc
 HOST_AR    ?= ar
 HOST_CFLAGS := -O1 -g -std=gnu99 $(WARN)
 
 HOST_LV_SRCS := $(shell find $(LVGL)/src -name '*.c' 2>/dev/null)
-HOST_LV_OBJS := $(patsubst $(LVGL)/%.c,$(HOST_BUILD)/lvgl/%.o,$(HOST_LV_SRCS))
-HOST_LVLIB   := $(HOST_BUILD)/liblvgl.a
+HOST_LV_OBJS := $(patsubst $(LVGL)/%.c,$(LV_CACHE)/host/%.o,$(HOST_LV_SRCS))
+HOST_LVLIB    = $(LV_CACHE)/host/liblvgl.a
 
 # Type-check the UI on the host. These files are only compiled under
 # UI_LVGL=1, which the host target does not set, so without this nothing
@@ -62,11 +83,11 @@ shots: $(HOST_BUILD)/preview
 	@cd $(HERE) && python3 $(TP_ROOT)/tools/bmp2png.py shots && rm -f shots/*.bmp
 	@ls $(HERE)shots/
 
-$(HOST_BUILD)/lvgl/%.o: $(LVGL)/%.c
+$(LV_CACHE)/host/%.o: $(LVGL)/%.c
 	@mkdir -p $(dir $@)
 	@$(HOST_CC) $(HOST_CFLAGS) $(LV_CFLAGS) -c -o $@ $<
 
-$(HOST_LV_OBJS): $(HERE)lv_conf_tp.h
+$(HOST_LV_OBJS): | $(LV_CACHE)
 
 $(HOST_LVLIB): $(HOST_LV_OBJS)
 	@echo "AR $@"
@@ -84,7 +105,7 @@ $(HOST_BUILD)/preview: $(HERE)preview.c $(HERE)tp_lv_screens.c $(HOST_LVLIB)
 # library reader rather than two that can drift.
 
 ARM_BUILD  := $(HERE)build-n31
-ARM_CC     := $(TOOLCHAIN)/bin/arm-linux-musleabi-gcc
+ARM_CC     := $(CCACHE) $(TOOLCHAIN)/bin/arm-linux-musleabi-gcc
 ARM_AR     := $(TOOLCHAIN)/bin/arm-linux-musleabi-ar
 ARM_STRIP  := $(TOOLCHAIN)/bin/arm-linux-musleabi-strip
 
@@ -92,14 +113,14 @@ ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
 ARM_CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) $(WARN) \
               -ffunction-sections -fdata-sections
 
-ARM_LV_OBJS := $(patsubst $(LVGL)/%.c,$(ARM_BUILD)/lvgl/%.o,$(HOST_LV_SRCS))
-ARM_LVLIB   := $(ARM_BUILD)/liblvgl.a
+ARM_LV_OBJS := $(patsubst $(LVGL)/%.c,$(LV_CACHE)/n31/%.o,$(HOST_LV_SRCS))
+ARM_LVLIB    = $(LV_CACHE)/n31/liblvgl.a
 
-$(ARM_BUILD)/lvgl/%.o: $(LVGL)/%.c
+$(LV_CACHE)/n31/%.o: $(LVGL)/%.c
 	@mkdir -p $(dir $@)
 	@$(ARM_CC) $(ARM_CFLAGS) $(LV_CFLAGS) -c -o $@ $<
 
-$(ARM_LV_OBJS): $(HERE)lv_conf_tp.h
+$(ARM_LV_OBJS): | $(LV_CACHE)
 
 $(ARM_LVLIB): $(ARM_LV_OBJS)
 	@echo "AR $@"
