@@ -41,6 +41,20 @@ HOST_LV_SRCS := $(shell find $(LVGL)/src -name '*.c' 2>/dev/null)
 HOST_LV_OBJS := $(patsubst $(LVGL)/%.c,$(HOST_BUILD)/lvgl/%.o,$(HOST_LV_SRCS))
 HOST_LVLIB   := $(HOST_BUILD)/liblvgl.a
 
+# Type-check the UI on the host. These files are only compiled under
+# UI_LVGL=1, which the host target does not set, so without this nothing
+# looks at them until someone cross-compiles - which is how a use-before-
+# declaration and a bad function-pointer cast both got as far as the device
+# build.
+.PHONY: check
+check:
+	@$(HOST_CC) -fsyntax-only $(HOST_CFLAGS) $(LV_CFLAGS) \
+	    -I$(TP_ROOT)/src -I$(TP_ROOT)/src/playback -I$(TP_ROOT)/src/db \
+	    -I$(TP_ROOT)/src/util -I$(TP_ROOT)/src/codec -I$(TP_ROOT)/src/fs \
+	    -I$(TP_ROOT)/third_party/sqlite -DTP_WITH_LVGL=1 -Werror \
+	    $(HERE)tp_lv_ui.c $(HERE)tp_lv_input.c $(HERE)tp_lv_screens.c
+	@echo 'the graphical UI type-checks on the host'
+
 .PHONY: shots n31 push clean
 shots: $(HOST_BUILD)/preview
 	@mkdir -p $(HERE)shots

@@ -102,6 +102,16 @@ static unsigned long now_ms(void)
     return (unsigned long)t.tv_sec * 1000UL + (unsigned long)(t.tv_nsec / 1000000);
 }
 
+/*
+ * LVGL wants a uint32_t; now_ms returns unsigned long. Those are the same width
+ * on this target and calling one through a pointer to the other is still
+ * undefined behaviour, so convert properly rather than casting the pointer.
+ */
+static uint32_t lv_tick_ms(void)
+{
+    return (uint32_t)now_ms();
+}
+
 static struct view *top_view(void)
 {
     return &s_ui.stack[s_ui.depth];
@@ -646,7 +656,7 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
     s_ui.stack[0].kind = V_MENU;
 
     lv_init();
-    lv_tick_set_cb((uint32_t (*)(void))now_ms);
+    lv_tick_set_cb(lv_tick_ms);
 
     disp = lv_linux_fbdev_create();
     if (!disp) {
