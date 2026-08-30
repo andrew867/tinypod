@@ -45,9 +45,25 @@ void tp_app_free(struct tp_app *app)
     tp_config_free(&app->cfg);
 }
 
+/* Where loading reports to. Null until set, every call guarded, so nothing
+   here depends on a UI existing. */
+static tp_load_progress_fn s_load_progress;
+
+void tp_app_set_load_progress(struct tp_app *app, tp_load_progress_fn fn)
+{
+    (void)app;                 /* one app per process; kept for symmetry */
+    s_load_progress = fn;
+}
+
+static void load_step(const char *stage, int pct)
+{
+    if (s_load_progress) s_load_progress(stage, pct);
+}
+
 int tp_app_load(struct tp_app *app)
 {
     int rc;
+    load_step("reading the database", -1);
     if (app->loaded) {
         tp_library_free(&app->lib);
         tp_library_init(&app->lib);
@@ -60,6 +76,16 @@ int tp_app_load(struct tp_app *app)
         return -1;
     }
     app->loaded = 1;
+
+    {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "%zu tracks, %zu artists",
+                 app->lib.track_count, app->lib.artist_count);
+        load_step(msg, -1);
+    }
+
+    /* A hundred stat calls across a read-only vfat mount is not free, and it
+       is the last thing between here and a usable screen, so it reports. */
     app->lib.health.music_folder_count = 0;
     {
         int i;
@@ -71,8 +97,11 @@ int tp_app_load(struct tp_app *app)
             if (p && tp_is_dir(p))
                 app->lib.health.music_folder_count++;
             free(p);
+            if ((i % 10) == 9)
+                load_step("checking music folders", i + 1);
         }
     }
+    load_step("ready", 100);
     return 0;
 }
 

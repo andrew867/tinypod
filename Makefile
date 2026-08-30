@@ -142,8 +142,19 @@ dirs:
 		$(BUILD)/codec $(BUILD)/playback $(BUILD)/ui $(BUILD)/ui/lvgl \
 		$(BUILD)/helix-aac $(BUILD)/helix-mp3 $(BUILD)/helix-mp3-real
 
+# Where the image builder looks for the device binary. The image is packed
+# from here, so staging by hand meant an image could be packed from whatever
+# was last copied over rather than what was last built - and a stale binary in
+# an image looks exactly like a bug in the app.
+IPOD_ARTIFACTS ?= /mnt/c/src/ipod/artifacts/linux-n31
+
 $(OUT)/tinypod: $(APP_OBJS) $(SQLITE_OBJ) $(DEC_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
+	@# Device builds only: the host binary is not what gets packed.
+	@if [ "$(TARGET)" = "n31" ] && [ -d "$(IPOD_ARTIFACTS)" ]; then \
+		cp -f $@ $(IPOD_ARTIFACTS)/tinypod && \
+		echo "  staged -> $(IPOD_ARTIFACTS)/tinypod"; \
+	fi
 
 $(BUILD)/%.o: src/%.c
 	@mkdir -p $(dir $@)

@@ -59,6 +59,12 @@ int tp_lv_list_rows(void);
 void tp_lv_show_now(const struct tp_lv_now *n);
 void tp_lv_show_message(const char *title, const char *body);
 
+/* Shown while the library loads. `pct` may be negative for a stage that cannot
+   say how far along it is, and the bar is then hidden rather than shown at
+   some arbitrary fill. Refreshes synchronously, because every caller is about
+   to block. */
+void tp_lv_show_scan(const char *where, const char *stage, int pct);
+
 /* The bar at the bottom saying what the buttons do here. */
 void tp_lv_set_hint(const char *hint);
 

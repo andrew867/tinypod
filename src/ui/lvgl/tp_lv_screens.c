@@ -128,8 +128,16 @@ static void ms_to_clock(unsigned long ms, char *out, size_t cap)
 
     /* Hours only when there are any: "3:07" reads better than "0:03:07", and
        an hour-long track is rare enough not to shape the common case. */
-    if (m >= 60)
-        snprintf(out, cap, "%lu:%02lu:%02lu", m / 60, m % 60, s % 60);
+    if (m >= 60) {
+        /* Clamped so the field has a width the compiler can see. `m` is an
+           unsigned long, so without this gcc must assume the hours could be
+           twenty digits and warns that the result may be truncated - which it
+           could be, for a duration no music file will ever have. */
+        unsigned long h = m / 60;
+        if (h > 99)
+            h = 99;
+        snprintf(out, cap, "%lu:%02lu:%02lu", h, m % 60, s % 60);
+    }
     else
         snprintf(out, cap, "%lu:%02lu", m, s % 60);
 }
@@ -468,6 +476,49 @@ void tp_lv_show_now(const struct tp_lv_now *n)
 }
 
 /* ---- a message ------------------------------------------------------------ */
+
+/*
+ * The scan screen, and the only thing on the display while the library loads.
+ *
+ * The load used to happen in main() before this UI existed, so a device with
+ * five hundred tracks sat on whatever the launcher had left on the panel for
+ * the whole of it - which looks exactly like an app that failed to start.
+ *
+ * Built on the message screen rather than as a new one: it is a title, a line
+ * of detail and a bar, and all three already exist here.
+ */
+void tp_lv_show_scan(const char *where, const char *stage, int pct)
+{
+    char body[256];
+
+    lv_label_set_text(s_title, "Scanning");
+    lv_label_set_text(s_count, "");
+    show(s_list, false);
+    show(s_now, false);
+    show(s_empty, false);
+    show(s_msg, true);
+
+    snprintf(body, sizeof body, "%s\n\n%s",
+             where && where[0] ? where : "", stage ? stage : "");
+    lv_label_set_text(s_msg_body, body);
+
+    /* The transport bar doubles as the progress bar. A negative percentage
+       means the stage cannot say how far along it is, and then the bar is
+       hidden rather than shown full or empty - both of which would be a
+       claim. */
+    if (pct < 0) {
+        show(s_bar_track, false);
+        show(s_bar_thumb, false);
+    } else {
+        if (pct > 100) pct = 100;
+        show(s_bar_track, true);
+        show(s_bar_thumb, true);
+        lv_obj_set_width(s_bar_thumb, (TP_LV_W - 24) * pct / 100);
+    }
+
+    /* Drawn now, not next frame: the caller is about to block. */
+    lv_refr_now(NULL);
+}
 
 void tp_lv_show_message(const char *title, const char *body)
 {

@@ -72,6 +72,11 @@ struct ui {
     int running;
     int was_playing;
 
+    /* Consecutive tracks that ended almost immediately. A broken sink makes
+       every track do that, and counting them is how the UI tells a dead
+       device from a queue of very short files. Reset by anything that plays. */
+    int fail_run;
+
     /*
      * Track indices for the current drill-down. Built once on entry rather
      * than filtered per row: a row filler runs six times a frame and walking
@@ -653,6 +658,13 @@ static void on_key(enum tp_lv_key k)
     }
 }
 
+/* Where tp_app_load reports to while the library is being read. */
+static void scan_progress(const char *stage, int pct)
+{
+    struct tp_app *app = s_ui.app;
+    tp_lv_show_scan(app ? app->vol.ipod_control_root : "", stage, pct);
+}
+
 /* ---- the loop ------------------------------------------------------------- */
 
 int tp_lv_ui_run(struct tp_app *app, const char *fb)
@@ -684,6 +696,28 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
     tp_player_set_async(app->player, 1);
 
     tp_lv_screens_init();
+
+    /*
+     * Load the library HERE, behind a screen, rather than in main() before
+     * this display existed. Five hundred tracks off a read-only vfat mount is
+     * not instant, and until this moved the panel simply kept whatever the
+     * launcher had left on it for the whole scan - which is indistinguishable
+     * from an app that failed to start.
+     */
+    if (!app->loaded) {
+        tp_lv_show_scan(app->vol.ipod_control_root, "starting", -1);
+        tp_app_set_load_progress(app, scan_progress);
+        int rc = tp_app_load(app);
+        tp_app_set_load_progress(app, NULL);
+
+        if (rc != 0) {
+            tp_lv_show_message("No library",
+                               "Could not read the iPod database.\n\n"
+                               "Is the volume mounted?");
+            lv_refr_now(NULL);
+        }
+    }
+
     draw();
 
     while (s_ui.running) {

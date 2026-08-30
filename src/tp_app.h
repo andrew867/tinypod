@@ -20,6 +20,17 @@ struct tp_app {
 
 int tp_app_init(struct tp_app *app, const char *mount, enum tp_player_backend backend);
 void tp_app_free(struct tp_app *app);
+/*
+ * Called as each stage of loading the library begins. `pct` is -1 where the
+ * stage cannot report progress. Set before tp_app_load; null clears it.
+ *
+ * A hook rather than a direct call into a UI because tp_app is shared by the
+ * command line, the terminal UI and the graphical one, and only one of those
+ * has a screen to draw on.
+ */
+typedef void (*tp_load_progress_fn)(const char *stage, int pct);
+void tp_app_set_load_progress(struct tp_app *app, tp_load_progress_fn fn);
+
 int tp_app_load(struct tp_app *app);
 
 int tp_app_cmd_scan(struct tp_app *app);
