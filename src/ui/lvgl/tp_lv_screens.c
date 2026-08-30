@@ -154,6 +154,10 @@ static lv_obj_t *s_hold;
 static lv_obj_t *s_list;
 static lv_obj_t *s_empty;
 static lv_obj_t *s_bar_track;
+/* The scan screen's own progress bar. Separate from s_bar_track, which is
+   the list's vertical scrollbar - reusing that drew the scan progress as a
+   grey block down the right-hand edge. */
+static lv_obj_t *s_scan_track, *s_scan_fill;
 static lv_obj_t *s_bar_thumb;
 
 typedef struct {
@@ -220,6 +224,13 @@ static void build_list(void)
     s_bar_track = panel(s_screen, BAR_X, LIST_TOP, BAR_W, ROW_H * ROWS,
                         C_SURFACE);
     s_bar_thumb = panel(s_screen, BAR_X, LIST_TOP, BAR_W, 20, C_TEXT_MUTE);
+
+    /* Horizontal, under the message body, hidden until a scan wants it. */
+    s_scan_track = panel(s_screen, MARGIN, 300, TP_LV_W - 2 * MARGIN, 4,
+                        C_SURFACE);
+    s_scan_fill  = panel(s_screen, MARGIN, 300, 0, 4, C_ACCENT);
+    lv_obj_add_flag(s_scan_track, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_scan_fill, LV_OBJ_FLAG_HIDDEN);
 
     s_empty = centred(s_screen, "", F_BODY, C_TEXT_MUTE, 180, 60);
 }
@@ -347,6 +358,8 @@ void tp_lv_show_list(const char *title, int count, int sel, int top,
                      void (*fill)(int index, struct tp_lv_row *out, void *ctx),
                      void *ctx, const char *empty)
 {
+    show(s_scan_track, false);
+    show(s_scan_fill, false);
     char t[24];
     int i;
 
@@ -404,6 +417,8 @@ void tp_lv_show_list(const char *title, int count, int sel, int top,
 
 void tp_lv_show_now(const struct tp_lv_now *n)
 {
+    show(s_scan_track, false);
+    show(s_scan_fill, false);
     char a[16], b[16], t[48];
 
     lv_label_set_text(s_title, "Now Playing");
@@ -506,14 +521,17 @@ void tp_lv_show_scan(const char *where, const char *stage, int pct)
        means the stage cannot say how far along it is, and then the bar is
        hidden rather than shown full or empty - both of which would be a
        claim. */
+    show(s_bar_track, false);
+    show(s_bar_thumb, false);
+
     if (pct < 0) {
-        show(s_bar_track, false);
-        show(s_bar_thumb, false);
+        show(s_scan_track, false);
+        show(s_scan_fill, false);
     } else {
         if (pct > 100) pct = 100;
-        show(s_bar_track, true);
-        show(s_bar_thumb, true);
-        lv_obj_set_width(s_bar_thumb, (TP_LV_W - 24) * pct / 100);
+        show(s_scan_track, true);
+        show(s_scan_fill, true);
+        lv_obj_set_width(s_scan_fill, (TP_LV_W - 2 * MARGIN) * pct / 100);
     }
 
     /* Drawn now, not next frame: the caller is about to block. */
@@ -522,6 +540,8 @@ void tp_lv_show_scan(const char *where, const char *stage, int pct)
 
 void tp_lv_show_message(const char *title, const char *body)
 {
+    show(s_scan_track, false);
+    show(s_scan_fill, false);
     lv_label_set_text(s_title, title ? title : "");
     lv_label_set_text(s_count, "");
     show(s_list, false);

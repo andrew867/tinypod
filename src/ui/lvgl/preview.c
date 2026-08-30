@@ -214,6 +214,19 @@ int main(int argc, char **argv)
     tp_lv_show_now(&n);
     shot("now-error");
 
+    /* The scan screen, in the three states worth seeing: a stage that cannot
+       report progress, one that can, and the counts it reports once the
+       database has been read. */
+    tp_lv_show_scan("/mnt/disk/iPod_Control", "reading the database", -1);
+    tp_lv_set_hint("");
+    shot("scan");
+
+    tp_lv_show_scan("/mnt/disk/iPod_Control", "496 tracks, 117 artists", -1);
+    shot("scan-counts");
+
+    tp_lv_show_scan("/mnt/disk/iPod_Control", "checking music folders", 60);
+    shot("scan-progress");
+
     tp_lv_show_message("About",
                        "TinyPod\n\n"
                        "Read-only iPod music\n"

@@ -24,13 +24,30 @@ HERE      := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 TP_ROOT   ?= $(HERE)../../..
 LVGL      ?= $(TP_ROOT)/../../NanoApps/lvgl
 
+# Compile LVGL from a native mirror rather than across the Windows mount.
+#
+# Measured on this tree, same compiler and flags: 267 s from /mnt/c against
+# 14 s from a mirror, because every header LVGL includes is read again for
+# every translation unit and each of those reads crosses drvfs. The ARM archive
+# here took twenty-nine minutes without it.
+#
+# The mirror lives with the LVGL checkout this already points at, so including
+# it adds no coupling that was not there. Guarded, because a clone without that
+# tree should fall back to the direct path rather than fail to parse.
+LVGL_MIRROR_MK := $(LVGL)/../apps/lvgl-mirror.mk
+ifneq ($(wildcard $(LVGL_MIRROR_MK)),)
+  include $(LVGL_MIRROR_MK)
+else
+  LVGL_SRC := $(LVGL)
+endif
+
 IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
 TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
 DEVICE    ?= root@192.168.7.2
 SSH_KEY   ?= $(IPOD_ROOT)/n31_id
 
 LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(HERE)lv_conf_tp.h\" \
-             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/include/lvgl \
+             -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/include/lvgl \
              -I$(HERE)
 
 WARN := -Wall -Wextra -Wno-unused-parameter
@@ -58,8 +75,8 @@ HOST_CC    ?= $(CCACHE) cc
 HOST_AR    ?= ar
 HOST_CFLAGS := -O1 -g -std=gnu99 $(WARN)
 
-HOST_LV_SRCS := $(shell find $(LVGL)/src -name '*.c' 2>/dev/null)
-HOST_LV_OBJS := $(patsubst $(LVGL)/%.c,$(LV_CACHE)/host/%.o,$(HOST_LV_SRCS))
+HOST_LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' 2>/dev/null)
+HOST_LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/host/%.o,$(HOST_LV_SRCS))
 HOST_LVLIB    = $(LV_CACHE)/host/liblvgl.a
 
 # Type-check the UI on the host. These files are only compiled under
@@ -83,7 +100,7 @@ shots: $(HOST_BUILD)/preview
 	@cd $(HERE) && python3 $(TP_ROOT)/tools/bmp2png.py shots && rm -f shots/*.bmp
 	@ls $(HERE)shots/
 
-$(LV_CACHE)/host/%.o: $(LVGL)/%.c
+$(LV_CACHE)/host/%.o: $(LVGL_SRC)/%.c
 	@mkdir -p $(dir $@)
 	@$(HOST_CC) $(HOST_CFLAGS) $(LV_CFLAGS) -c -o $@ $<
 
@@ -113,10 +130,10 @@ ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
 ARM_CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) $(WARN) \
               -ffunction-sections -fdata-sections
 
-ARM_LV_OBJS := $(patsubst $(LVGL)/%.c,$(LV_CACHE)/n31/%.o,$(HOST_LV_SRCS))
+ARM_LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/n31/%.o,$(HOST_LV_SRCS))
 ARM_LVLIB    = $(LV_CACHE)/n31/liblvgl.a
 
-$(LV_CACHE)/n31/%.o: $(LVGL)/%.c
+$(LV_CACHE)/n31/%.o: $(LVGL_SRC)/%.c
 	@mkdir -p $(dir $@)
 	@$(ARM_CC) $(ARM_CFLAGS) $(LV_CFLAGS) -c -o $@ $<
 
