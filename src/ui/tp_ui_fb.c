@@ -26,6 +26,7 @@ enum ui_screen {
     UI_ARTISTS,
     UI_ALBUMS,
     UI_PLAYLISTS,
+    UI_ARTIST_ALBUMS,  /* the albums by one artist */
     UI_TRACKS,         /* the tracks under one artist, album or playlist */
     UI_NOW,
     UI_SETTINGS,
@@ -45,16 +46,22 @@ struct ui_state {
      * signposts to rooms with no doors, and a playlist could only ever play
      * its first track.
      *
-     * `filtered` holds indices into lib.tracks, built once on entry rather
-     * than filtered per row. One level is enough: everything reachable from
-     * the home menu is a list and then its tracks, so a full view stack would
-     * be machinery for a depth that does not exist.
+     * `filtered` holds indices into lib.tracks and `falbums` indices into
+     * lib.albums, each built once on entry rather than filtered per row.
+     *
+     * There are three levels now - artist, that artist's albums, then the
+     * tracks on one - so there is a real stack. Two ad-hoc back_to fields
+     * covered one level and would not have survived this one.
      */
     size_t *filtered;
     size_t  filtered_n;
+    size_t *falbums;
+    size_t  falbums_n;
     char    title[160];
-    enum ui_screen back_to;
-    int     back_sel;
+    char    artist[96];        /* whose albums are showing, for the header */
+
+    struct { enum ui_screen screen; int sel; } stack[4];
+    int     depth;
 };
 
 static void filtered_free(struct ui_state *ui)
@@ -62,6 +69,38 @@ static void filtered_free(struct ui_state *ui)
     free(ui->filtered);
     ui->filtered = NULL;
     ui->filtered_n = 0;
+}
+
+static void falbums_free(struct ui_state *ui)
+{
+    free(ui->falbums);
+    ui->falbums = NULL;
+    ui->falbums_n = 0;
+}
+
+/* Remember where we are, then go somewhere. Silently refusing to descend past
+   the stack rather than overflowing it: the menu is four deep by
+   construction, and a fifth level would be a bug in this file, not input. */
+static void push_to(struct ui_state *ui, enum ui_screen to)
+{
+    if (ui->depth < (int)(sizeof ui->stack / sizeof ui->stack[0])) {
+        ui->stack[ui->depth].screen = ui->screen;
+        ui->stack[ui->depth].sel = ui->sel;
+        ui->depth++;
+    }
+    ui->screen = to;
+    ui->sel = 0;
+}
+
+/* One level back, to exactly the row that was selected on the way in. */
+static int pop_back(struct ui_state *ui)
+{
+    if (ui->depth <= 0)
+        return 0;
+    ui->depth--;
+    ui->screen = ui->stack[ui->depth].screen;
+    ui->sel = ui->stack[ui->depth].sel;
+    return 1;
 }
 
 static int str_same(const char *a, const char *b)
@@ -111,6 +150,17 @@ static void build_filtered(struct ui_state *ui, enum ui_screen from, int which)
         if (from == UI_ARTISTS) {
             if (str_same(t->artist, app->lib.artists[which].name))
                 ui->filtered[n++] = i;
+        } else if (from == UI_ARTIST_ALBUMS) {
+            /* This artist's tracks on this album. Matched against the artist
+               we drilled in from, not against the album entry's own artist:
+               the entry is one of possibly several for the same record, and
+               filtering by its credit would hide the tracks credited the
+               other way - which is the same split that made it two entries. */
+            struct tp_album_entry *a = &app->lib.albums[ui->falbums[which]];
+            if (str_same(t->album, a->album) &&
+                (str_same(t->artist, ui->artist) ||
+                 str_same(t->album_artist, ui->artist)))
+                ui->filtered[n++] = i;
         } else {
             struct tp_album_entry *a = &app->lib.albums[which];
             /* album_artist as well as artist, or a compilation shows one
@@ -123,23 +173,72 @@ static void build_filtered(struct ui_state *ui, enum ui_screen from, int which)
     }
     ui->filtered_n = n;
 
-    if (from == UI_ARTISTS)
+    if (from == UI_ARTISTS) {
         snprintf(ui->title, sizeof ui->title, "%s",
                  app->lib.artists[which].name);
-    else
-        snprintf(ui->title, sizeof ui->title, "%s - %s",
-                 app->lib.albums[which].artist,
-                 app->lib.albums[which].album);
+    } else if (from == UI_ARTIST_ALBUMS) {
+        struct tp_album_entry *a = &app->lib.albums[ui->falbums[which]];
+        snprintf(ui->title, sizeof ui->title, "%s - %s", ui->artist, a->album);
+    } else {
+        struct tp_album_entry *a = &app->lib.albums[which];
+        snprintf(ui->title, sizeof ui->title, "%s - %s", a->artist, a->album);
+    }
+}
+
+/* The albums one artist appears on, as indices into lib.albums.
+ *
+ * Matched on the album entry's artist OR any of that artist's tracks naming
+ * it, so a guest appearance on somebody else's record still shows up under
+ * the guest - which is what a listener means by "their albums" and is not
+ * what a strict match on the album's own artist field gives.
+ */
+static void build_artist_albums(struct ui_state *ui, int which)
+{
+    struct tp_app *app = ui->app;
+    const char *who = app->lib.artists[which].name;
+    size_t i, j, n = 0;
+
+    falbums_free(ui);
+    snprintf(ui->artist, sizeof ui->artist, "%s", who ? who : "?");
+
+    ui->falbums = calloc(app->lib.album_count ? app->lib.album_count : 1,
+                         sizeof *ui->falbums);
+    if (!ui->falbums)
+        return;
+
+    for (i = 0; i < app->lib.album_count; i++) {
+        struct tp_album_entry *a = &app->lib.albums[i];
+        int mine = str_same(a->artist, who);
+        size_t k;
+
+        for (j = 0; !mine && j < app->lib.track_count; j++) {
+            struct tp_track *t = &app->lib.tracks[j];
+            if (str_same(t->artist, who) && str_same(t->album, a->album))
+                mine = 1;
+        }
+        if (!mine)
+            continue;
+
+        /* One record can be two album entries: the library holds one per
+           (artist, album) pair, so a title credited one way on some tracks
+           and another way on others appears twice, identically, with nothing
+           on screen to say why. Keep the first and drop the rest - the track
+           list below matches on the artist we came from rather than on the
+           entry's own artist, so nothing is lost with the duplicate row. */
+        for (k = 0; k < n; k++)
+            if (str_same(app->lib.albums[ui->falbums[k]].album, a->album))
+                break;
+        if (k == n)
+            ui->falbums[n++] = i;
+    }
+    ui->falbums_n = n;
 }
 
 /* Enter the track list for row `which` of the list we are on. */
 static void drill_in(struct ui_state *ui, enum ui_screen from, int which)
 {
     build_filtered(ui, from, which);
-    ui->back_to = from;
-    ui->back_sel = which;
-    ui->screen = UI_TRACKS;
-    ui->sel = 0;
+    push_to(ui, UI_TRACKS);
 }
 
 static void draw_term(struct ui_state *ui)
@@ -184,6 +283,14 @@ static void draw_term(struct ui_state *ui)
         for (i = 0; i < ui->app->lib.playlist_count && i < 20; i++)
             printf("  %s %s (%zu)\n", (int)i == ui->sel ? ">" : " ",
                    ui->app->lib.playlists[i].name, ui->app->lib.playlists[i].track_count);
+        break;
+    case UI_ARTIST_ALBUMS:
+        printf("%s (%zu albums)\n", ui->artist, ui->falbums_n);
+        if (!ui->falbums_n)
+            printf("  (no albums)\n");
+        for (i = 0; i < ui->falbums_n && i < 20; i++)
+            printf("  %s %s\n", (int)i == ui->sel ? ">" : " ",
+                   ui->app->lib.albums[ui->falbums[i]].album);
         break;
     case UI_TRACKS:
         printf("%s (%zu)\n", ui->title, ui->filtered_n);
@@ -239,8 +346,25 @@ static void activate(struct ui_state *ui)
             ui->was_playing = 1;
         ui->screen = UI_NOW;
     } else if (ui->screen == UI_ARTISTS && ui->app->lib.artist_count) {
-        if ((size_t)ui->sel < ui->app->lib.artist_count)
-            drill_in(ui, UI_ARTISTS, ui->sel);
+        if ((size_t)ui->sel < ui->app->lib.artist_count) {
+            build_artist_albums(ui, ui->sel);
+            /* One album, or none the library knows about: skip the list of
+               one and go straight to the tracks. A menu whose only entry is
+               the thing you already asked for is a keypress for nothing. */
+            if (ui->falbums_n == 1) {
+                build_filtered(ui, UI_ARTIST_ALBUMS, 0);
+                push_to(ui, UI_TRACKS);
+            } else if (ui->falbums_n == 0) {
+                drill_in(ui, UI_ARTISTS, ui->sel);
+            } else {
+                push_to(ui, UI_ARTIST_ALBUMS);
+            }
+        }
+    } else if (ui->screen == UI_ARTIST_ALBUMS && ui->falbums_n) {
+        if ((size_t)ui->sel < ui->falbums_n) {
+            build_filtered(ui, UI_ARTIST_ALBUMS, ui->sel);
+            push_to(ui, UI_TRACKS);
+        }
     } else if (ui->screen == UI_ALBUMS && ui->app->lib.album_count) {
         if ((size_t)ui->sel < ui->app->lib.album_count)
             drill_in(ui, UI_ALBUMS, ui->sel);
@@ -268,6 +392,7 @@ static int max_sel(struct ui_state *ui)
     case UI_ARTISTS: return (int)ui->app->lib.artist_count - 1;
     case UI_ALBUMS: return (int)ui->app->lib.album_count - 1;
     case UI_PLAYLISTS: return (int)ui->app->lib.playlist_count - 1;
+    case UI_ARTIST_ALBUMS: return (int)ui->falbums_n - 1;
     case UI_TRACKS: return (int)ui->filtered_n - 1;
     default: return 0;
     }
@@ -349,9 +474,12 @@ int tp_ui_fb_run(struct tp_app *app)
                 ui.running = 0;
             } else if (ui.screen == UI_TRACKS) {
                 filtered_free(&ui);
-                ui.screen = ui.back_to;
-                ui.sel = ui.back_sel;
+                if (!pop_back(&ui)) { ui.screen = UI_HOME; ui.sel = 0; }
+            } else if (ui.screen == UI_ARTIST_ALBUMS) {
+                falbums_free(&ui);
+                if (!pop_back(&ui)) { ui.screen = UI_HOME; ui.sel = 0; }
             } else {
+                ui.depth = 0;
                 ui.screen = UI_HOME;
                 ui.sel = 0;
             }
