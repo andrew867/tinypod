@@ -18,6 +18,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <time.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,16 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+/* Monotonic nanoseconds. Not the wall clock: that can step, and a position
+   that jumps backwards when NTP corrects is worse than one that drifts. */
+static unsigned long long mono_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000000ull +
+           (unsigned long long)t.tv_nsec;
+}
 
 struct tp_player {
     enum tp_player_backend backend;
@@ -49,6 +60,20 @@ struct tp_player {
     int channels;
     unsigned long dur_ms;
     unsigned long long played_samples;
+
+    /*
+     * When playback started, and how much of that was spent paused, so
+     * "how long have we been playing" is answerable. Monotonic: the wall
+     * clock can step, and a clock that steps backwards would make the
+     * position jump about.
+     */
+    unsigned long long started_ns;
+    unsigned long long paused_ns;      /* accumulated */
+    unsigned long long pause_began_ns;
+
+    /* The device took data faster than real time for long enough that it
+       cannot be playing it. */
+    int not_pacing;
 };
 
 const char *tp_player_backend_name(enum tp_player_backend b)
@@ -220,6 +245,10 @@ static int play_internal(struct tp_player *p, const char *path)
     p->paused = 0;
     p->done = 0;
     p->played_samples = 0;
+    p->started_ns = mono_ns();
+    p->paused_ns = 0;
+    p->pause_began_ns = 0;
+    p->not_pacing = 0;
     p->rate = 0;
     p->channels = 0;
     p->dur_ms = 0;
@@ -305,6 +334,20 @@ int tp_player_wait(struct tp_player *p)
     return p->err[0] ? -1 : 0;
 }
 
+/* How long we have been playing, excluding time spent paused. */
+static unsigned long long playing_ms_locked(const struct tp_player *p)
+{
+    unsigned long long paused = p->paused_ns;
+    if (p->pause_began_ns)
+        paused += mono_ns() - p->pause_began_ns;
+    if (!p->started_ns)
+        return 0;
+    unsigned long long ns = mono_ns() - p->started_ns;
+    if (ns <= paused)
+        return 0;
+    return (ns - paused) / 1000000ull;
+}
+
 unsigned long tp_player_position_ms(struct tp_player *p)
 {
     unsigned long ms;
@@ -317,8 +360,46 @@ unsigned long tp_player_position_ms(struct tp_player *p)
                              ((unsigned long long)p->rate * (unsigned long long)p->channels));
     else
         ms = 0;
+
+    /*
+     * Bounded by how long we have actually been playing.
+     *
+     * played_samples counts what was handed to the driver. On a device that
+     * paces the stream that is the same thing as what came out, give or take
+     * the buffer. On a device that accepts everything and plays none of it,
+     * the decode loop never blocks and this counter races - which is what a
+     * clock running "way too fast" is measuring.
+     *
+     * Audio cannot leave a device faster than real time, so the elapsed time
+     * is a hard ceiling. When the device behaves, the ceiling never binds.
+     */
+    if (p->state == TP_PLAYER_PLAYING || p->state == TP_PLAYER_PAUSED) {
+        unsigned long elapsed = (unsigned long)playing_ms_locked(p);
+        if (ms > elapsed) {
+            /* A second or two ahead is just the output buffer. Much more than
+               that and nothing is being played at all. */
+            if (ms - elapsed > 2000)
+                p->not_pacing = 1;
+            ms = elapsed;
+        }
+    }
     pthread_mutex_unlock(&p->lock);
     return ms;
+}
+
+/* True when the audio device has been taking data faster than it could
+   possibly play it. Almost always means the stream is not actually running -
+   worth saying out loud, because the alternative is the user inferring it
+   from a clock that runs fast. */
+int tp_player_not_pacing(struct tp_player *p)
+{
+    int v;
+    if (!p)
+        return 0;
+    pthread_mutex_lock(&p->lock);
+    v = p->not_pacing;
+    pthread_mutex_unlock(&p->lock);
+    return v;
 }
 
 unsigned long tp_player_duration_ms(struct tp_player *p)
@@ -556,6 +637,9 @@ int tp_player_pause(struct tp_player *p)
         if (p->thread_live && !p->done && p->state == TP_PLAYER_PLAYING) {
             p->paused = 1;
             p->state = TP_PLAYER_PAUSED;
+            /* Paused time is not playing time, or the elapsed ceiling would
+               keep rising while nothing came out and stop bounding anything. */
+            p->pause_began_ns = mono_ns();
             ok = 1;
         }
         pthread_mutex_unlock(&p->lock);
@@ -585,6 +669,10 @@ int tp_player_resume(struct tp_player *p)
         if (p->thread_live && !p->done && p->state == TP_PLAYER_PAUSED) {
             p->paused = 0;
             p->state = TP_PLAYER_PLAYING;
+            if (p->pause_began_ns) {
+                p->paused_ns += mono_ns() - p->pause_began_ns;
+                p->pause_began_ns = 0;
+            }
             pthread_cond_broadcast(&p->cond);
             ok = 1;
         }

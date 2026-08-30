@@ -119,8 +119,19 @@ int main(int argc, char **argv)
         return rc;
     }
 
-    if (tp_app_init(&app, mount, backend) != 0)
-        return 1;
+    {
+        int irc = tp_app_init(&app, mount, backend);
+        /*
+         * A missing volume is fatal to the command-line tools - listing
+         * nothing is not a useful answer - and survivable for the two UIs,
+         * which start and say so on screen. An app that exits before it draws
+         * anything is indistinguishable from one that crashed, and from the
+         * launcher that is exactly what it looked like.
+         */
+        int ui_cmd = (strcmp(cmd, "ui") == 0 || strcmp(cmd, "gui") == 0);
+        if (irc != 0 && !(irc == TP_APP_NO_VOLUME && ui_cmd))
+            return 1;
+    }
 
     if (strcmp(cmd, "scan") == 0) {
         rc = tp_app_cmd_scan(&app);

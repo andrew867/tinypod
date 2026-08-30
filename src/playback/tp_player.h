@@ -53,6 +53,12 @@ int tp_player_wait(struct tp_player *p);
 
 /* Progress and format of the track being played. Zero when idle. */
 unsigned long tp_player_position_ms(struct tp_player *p);
+
+/* True once the audio device has taken data faster than it could possibly
+   play it - which almost always means the stream is not running at all. The
+   position is bounded by elapsed time, so the usual symptom of this (a clock
+   racing) no longer shows; this is how it says so instead. */
+int tp_player_not_pacing(struct tp_player *p);
 unsigned long tp_player_duration_ms(struct tp_player *p);
 int tp_player_rate(struct tp_player *p);
 int tp_player_channels(struct tp_player *p);

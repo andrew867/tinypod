@@ -26,7 +26,13 @@ int tp_app_init(struct tp_app *app, const char *mount, enum tp_player_backend ba
         tp_error("Could not find an iPod volume.\n"
                  "Pass --mount /path (volume root or iPod_Control),\n"
                  "or set TINYPOD_MOUNT, or mount the disk at /mnt/disk.");
-        return -1;
+        /* Distinct from a real failure. The command-line tools treat it
+           as fatal, because listing nothing is not a useful answer; the
+           UIs start anyway and say it on screen, because an app that
+           exits before drawing is indistinguishable from one that
+           crashed. */
+        app->no_volume = 1;
+        return TP_APP_NO_VOLUME;
     }
     return 0;
 }
@@ -71,8 +77,13 @@ int tp_app_load(struct tp_app *app)
     rc = tp_db_load(&app->lib, app->vol.mount_root, app->vol.ipod_control_root,
                     TP_DB_FORMAT_UNKNOWN);
     if (rc != 0) {
+        /* With no volume there is no path to name, and printing
+           "(null)" reads like a bug in the loader rather than a disk
+           that is not mounted. */
         tp_error("Could not load the iPod music library under:\n  %s",
-                 app->vol.ipod_control_root);
+                 app->vol.ipod_control_root
+                     ? app->vol.ipod_control_root
+                     : "(no volume mounted)");
         return -1;
     }
     app->loaded = 1;

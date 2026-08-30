@@ -864,6 +864,13 @@ static void draw(void)
             const char *e = tp_player_last_error(app->player);
             if (e && e[0] && n.state == 0)
                 n.error = e;
+            /* Said while it is still "playing", because that is when it is
+               wrong and when the user is looking at it. The device is taking
+               samples far faster than it could play them, so nothing is
+               coming out - and without this the only clue was a clock that
+               used to run fast and no longer does. */
+            else if (tp_player_not_pacing(app->player))
+                n.error = "audio device is not playing what it is given";
         }
 
         tp_lv_show_now(&n);
@@ -1094,7 +1101,18 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
      * launcher had left on it for the whole scan - which is indistinguishable
      * from an app that failed to start.
      */
-    if (!app->loaded) {
+    /* No volume at all: say so and stay up. Exiting here is what made this
+       look like a crash from the launcher, and the explanation went to a tty
+       nobody was looking at. */
+    if (app->no_volume) {
+        tp_lv_show_message("No music volume",
+                           "Nothing is mounted.\n\n"
+                           "Mount the disk with\n"
+                           "n31-mount-disk, then\n"
+                           "start TinyPod again.");
+        tp_lv_set_hint("hold PLAY back");
+        lv_refr_now(NULL);
+    } else if (!app->loaded) {
         tp_lv_show_scan(app->vol.ipod_control_root, "starting", -1);
         tp_app_set_load_progress(app, scan_progress);
         int rc = tp_app_load(app);

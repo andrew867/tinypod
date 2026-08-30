@@ -247,6 +247,11 @@ static void draw_term(struct ui_state *ui)
     size_t i;
     printf("\033[2J\033[H");
     printf("==== TinyPod ====\n");
+    /* At the top of every screen, because with no volume every list is
+       empty, and an empty list looks like a library that failed to
+       read rather than a disk that was never mounted. */
+    if (ui->app->no_volume)
+        printf("  no music volume - mount the disk, then restart\n");
     switch (ui->screen) {
     case UI_HOME:
         printf("  %s Songs\n", ui->sel == 0 ? ">" : " ");
@@ -306,6 +311,13 @@ static void draw_term(struct ui_state *ui)
     case UI_NOW:
         printf("Now Playing\n");
         tp_app_cmd_status(ui->app);
+        /* The device is accepting samples far faster than it could
+           play them, so nothing is coming out. Worth saying: the
+           symptom used to be a clock that ran fast, and now that the
+           clock is bounded there would be no symptom at all. */
+        if (tp_player_not_pacing(ui->app->player))
+            printf("  WARNING: the audio device is not playing what "
+                   "it is given\n");
         break;
     case UI_SETTINGS:
         printf("Settings\n  shuffle: %s\n  backend: %s\n",

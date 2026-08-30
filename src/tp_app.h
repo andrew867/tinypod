@@ -8,7 +8,14 @@
 
 #include <stdio.h>
 
+/* tp_app_init: no iPod volume was found. Everything else about the app is
+   set up and usable - this is the one failure the UIs are expected to carry
+   on through and report rather than exit on. */
+#define TP_APP_NO_VOLUME (-2)
+
 struct tp_app {
+    /* No volume was detected at startup. */
+    int no_volume;
     struct tp_volume vol;
     struct tp_library lib;
     struct tp_player *player;
