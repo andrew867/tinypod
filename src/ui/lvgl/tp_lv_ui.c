@@ -17,6 +17,7 @@
 #include "tp_lv_input.h"
 
 #include "tp_app.h"
+#include "util/tp_build.h"
 #include "tp_log.h"
 
 #include "lvgl.h"
@@ -712,15 +713,22 @@ static void draw(void)
         break;
     }
 
-    default:
-        tp_lv_show_message("About",
-                           "TinyPod\n\n"
-                           "Read-only iPod music\n"
-                           "for N31 Linux.\n\n"
-                           "Nothing under iPod_Control\n"
-                           "is ever written.");
+    default: {
+        /* The build, on the one screen that exists to say what this is. An
+           old copy on the device is indistinguishable from a fresh one
+           without it. */
+        static char about[256];
+        snprintf(about, sizeof about,
+                 "TinyPod\n\n"
+                 "Read-only iPod music\n"
+                 "for N31 Linux.\n\n"
+                 "Nothing under iPod_Control\n"
+                 "is ever written.\n\n"
+                 "%s", tp_build_version());
+        tp_lv_show_message("About", about);
         tp_lv_set_hint("hold PLAY back");
         break;
+    }
     }
 }
 

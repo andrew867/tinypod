@@ -1,4 +1,5 @@
 #include "tp_app.h"
+#include "util/tp_build.h"
 #include "tp_log.h"
 #include "tp_ui_keys.h"
 #include "tp_util.h"
@@ -313,6 +314,8 @@ static void draw_term(struct ui_state *ui)
         break;
     case UI_ABOUT:
         printf("TinyPod — free iPod-native player for N31 Linux\n"
+               "build %s\n", tp_build_version());
+        printf(
                "Read-only. No sync. No database rebuild.\n");
         break;
     }

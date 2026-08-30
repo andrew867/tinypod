@@ -15,6 +15,7 @@ OUT    := out/$(TARGET)
 SRC_APP := \
 	src/main.c \
 	src/tp_app.c \
+	src/util/tp_build.c \
 	src/util/tp_log.c \
 	src/util/tp_util.c \
 	src/util/tp_config.c \
@@ -44,6 +45,21 @@ SRC_MP3R := $(wildcard $(HELIX_MP3_DIR)/real/*.c)
 INCLUDES := -Isrc -Isrc/codec -Isrc/db -Isrc/fs -Isrc/playback -Isrc/ui -Isrc/util \
 	-Ithird_party/sqlite \
 	-I$(HELIX_AAC_DIR) -I$(HELIX_MP3_DIR)/pub -I$(HELIX_MP3_DIR)/real
+
+# ---- build stamp -----------------------------------------------------------
+#
+# Which build is this. A copy on the device that is months old looks exactly
+# like the one just compiled, right up until an afternoon goes into
+# reproducing a fault that was fixed in April.
+#
+# Only tp_build.o carries it, and that object depends on BUILD_FORCE - which
+# has no rule and no file, so it is always out of date. A fresh stamp is one
+# recompile, not a rebuild of the world; and a stamp cached with the rest of
+# the objects would say "current" while being stale, which is the exact
+# confusion it exists to end.
+BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
+BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+STAMP_DEFS  := -DTP_BUILD_STAMP='"$(BUILD_STAMP)"' -DTP_BUILD_GIT='"$(BUILD_GIT)"'
 
 WARN := -Wall -Wextra -Wpedantic -Werror
 # sqlite and the Helix decoders are third_party — compiled without -Werror
@@ -159,6 +175,13 @@ $(OUT)/tinypod: $(APP_OBJS) $(SQLITE_OBJ) $(DEC_OBJS)
 $(BUILD)/%.o: src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+.PHONY: BUILD_FORCE
+BUILD_FORCE:
+
+$(BUILD)/util/tp_build.o: src/util/tp_build.c BUILD_FORCE
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(STAMP_DEFS) -c -o $@ $<
 
 $(SQLITE_OBJ): $(SRC_SQLITE)
 	@mkdir -p $(dir $@)

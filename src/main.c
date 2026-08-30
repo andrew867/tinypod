@@ -1,4 +1,5 @@
 #include "tp_app.h"
+#include "util/tp_build.h"
 #ifdef TP_WITH_LVGL
 #include "tp_lv_ui.h"
 #endif
@@ -11,8 +12,14 @@
 
 static void usage(void)
 {
+    /* In the banner, on the same stream. On stdout while the banner
+       went to stderr it came out in the wrong order as soon as the
+       output was piped: stdout is block-buffered when it is not a
+       terminal and stderr is not, so the banner overtook it. */
     fprintf(stderr,
-            "TinyPod — read-only iPod music player\n\n"
+            "TinyPod — read-only iPod music player\n"
+            "build %s\n\n", tp_build_version());
+    fprintf(stderr,
             "Usage:\n"
             "  tinypod [--mount PATH] [--backend null|external|alsa] [--debug] <cmd> [args]\n\n"
             "Commands:\n"
