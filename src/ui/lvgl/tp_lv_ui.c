@@ -49,6 +49,7 @@ enum view_kind {
     V_ARTISTS,
     V_ALBUMS,
     V_PLAYLISTS,
+    V_ARTIST_ALBUMS, /* the albums by one artist */
     V_TRACKS,        /* the tracks under an artist, album or playlist */
     V_NOW,
     V_SETTINGS,
@@ -84,6 +85,13 @@ struct ui {
      */
     size_t *filtered;
     size_t filtered_n;
+
+    /* The albums by the artist currently drilled into, as indices into
+       lib.albums, and whose they are - the name is what the track filter
+       below matches on, not the album entry's own credit. */
+    size_t *falbums;
+    size_t  falbums_n;
+    char    artist[96];
 
     char title_buf[96];
 };
@@ -220,6 +228,19 @@ static void fill_albums(int i, struct tp_lv_row *out, void *ctx)
     out->badge = badge[slot];
 }
 
+static void fill_artist_albums(int i, struct tp_lv_row *out, void *ctx)
+{
+    struct tp_app *app = ctx;
+    static char badge[8][12];
+    int slot = i % 8;
+    struct tp_album_entry *a = &app->lib.albums[s_ui.falbums[i]];
+
+    out->line1 = safe(a->album, "Unknown album");
+    out->line2 = s_ui.artist;
+    snprintf(badge[slot], sizeof badge[slot], "%zu", a->track_count);
+    out->badge = badge[slot];
+}
+
 static void fill_playlists(int i, struct tp_lv_row *out, void *ctx)
 {
     struct tp_app *app = ctx;
@@ -286,6 +307,13 @@ static void filtered_free(void)
     s_ui.filtered_n = 0;
 }
 
+static void falbums_free(void)
+{
+    free(s_ui.falbums);
+    s_ui.falbums = NULL;
+    s_ui.falbums_n = 0;
+}
+
 static int str_eq(const char *a, const char *b)
 {
     if (!a || !b) return a == b;
@@ -333,6 +361,16 @@ static void build_filtered(enum view_kind from, int which)
         if (from == V_ARTISTS) {
             if (str_eq(t->artist, app->lib.artists[which].name))
                 s_ui.filtered[n++] = i;
+        } else if (from == V_ARTIST_ALBUMS) {
+            /* This artist's tracks on this album. Matched against the artist
+               we drilled in from, not the album entry's own credit: the entry
+               is one of possibly several for the same record, and filtering
+               by its credit would hide the tracks credited the other way. */
+            struct tp_album_entry *a = &app->lib.albums[s_ui.falbums[which]];
+            if (str_eq(t->album, a->album) &&
+                (str_eq(t->artist, s_ui.artist) ||
+                 str_eq(t->album_artist, s_ui.artist)))
+                s_ui.filtered[n++] = i;
         } else {
             struct tp_album_entry *a = &app->lib.albums[which];
             if (str_eq(t->album, a->album) &&
@@ -342,6 +380,49 @@ static void build_filtered(enum view_kind from, int which)
         }
     }
     s_ui.filtered_n = n;
+}
+
+/*
+ * The albums one artist appears on, as indices into lib.albums.
+ *
+ * Matched on the album entry's artist OR any of that artist's tracks naming
+ * it, so a guest appearance on somebody else's record still shows up under
+ * the guest - which is what a listener means by "their albums" and is not
+ * what a strict match on the entry's own artist field gives.
+ */
+static void build_artist_albums(int which)
+{
+    struct tp_app *app = s_ui.app;
+    const char *who = app->lib.artists[which].name;
+    size_t i, j, k, n = 0;
+
+    falbums_free();
+    snprintf(s_ui.artist, sizeof s_ui.artist, "%s", who ? who : "?");
+
+    s_ui.falbums = calloc(app->lib.album_count ? app->lib.album_count : 1,
+                          sizeof *s_ui.falbums);
+    if (!s_ui.falbums) return;
+
+    for (i = 0; i < app->lib.album_count; i++) {
+        struct tp_album_entry *a = &app->lib.albums[i];
+        int mine = str_eq(a->artist, who);
+
+        for (j = 0; !mine && j < app->lib.track_count; j++) {
+            struct tp_track *t = &app->lib.tracks[j];
+            if (str_eq(t->artist, who) && str_eq(t->album, a->album))
+                mine = 1;
+        }
+        if (!mine) continue;
+
+        /* One record can be two album entries - the library holds one per
+           (artist, album) pair - and they render identically, with nothing on
+           screen to say why there are two. */
+        for (k = 0; k < n; k++)
+            if (str_eq(app->lib.albums[s_ui.falbums[k]].album, a->album))
+                break;
+        if (k == n) s_ui.falbums[n++] = i;
+    }
+    s_ui.falbums_n = n;
 }
 
 /* Defined below with the other drawing; declared here because opening a
@@ -369,9 +450,11 @@ static void pop(void)
 {
     if (s_ui.depth > 0)
         s_ui.depth--;
-    /* The filtered list belongs to the view that was popped. */
+    /* Each list belongs to the view that was popped. */
     if (top_view()->kind != V_TRACKS)
         filtered_free();
+    if (top_view()->kind != V_ARTIST_ALBUMS)
+        falbums_free();
 }
 
 static int view_count(struct view *v)
@@ -384,6 +467,7 @@ static int view_count(struct view *v)
     case V_ARTISTS:   return (int)app->lib.artist_count;
     case V_ALBUMS:    return (int)app->lib.album_count;
     case V_PLAYLISTS: return (int)app->lib.playlist_count;
+    case V_ARTIST_ALBUMS: return (int)s_ui.falbums_n;
     case V_TRACKS:    return (int)s_ui.filtered_n;
     case V_SETTINGS:  return SETTINGS_N;
     default:          return 0;
@@ -443,8 +527,27 @@ static void activate(void)
         break;
 
     case V_ARTISTS:
-        build_filtered(V_ARTISTS, v->sel);
-        push(V_TRACKS, v->sel, app->lib.artists[v->sel].name);
+        build_artist_albums(v->sel);
+        /* One album, or none the library knows about: skip the list of one.
+           A menu whose only entry is the thing you already asked for is a
+           keypress for nothing. */
+        if (s_ui.falbums_n == 1) {
+            build_filtered(V_ARTIST_ALBUMS, 0);
+            push(V_TRACKS, 0, app->lib.artists[v->sel].name);
+        } else if (s_ui.falbums_n == 0) {
+            build_filtered(V_ARTISTS, v->sel);
+            push(V_TRACKS, v->sel, app->lib.artists[v->sel].name);
+        } else {
+            push(V_ARTIST_ALBUMS, v->sel, app->lib.artists[v->sel].name);
+        }
+        break;
+
+    case V_ARTIST_ALBUMS:
+        if ((size_t)v->sel < s_ui.falbums_n) {
+            build_filtered(V_ARTIST_ALBUMS, v->sel);
+            push(V_TRACKS, v->sel,
+                 app->lib.albums[s_ui.falbums[v->sel]].album);
+        }
         break;
 
     case V_ALBUMS:
@@ -532,6 +635,14 @@ static void draw(void)
     case V_PLAYLISTS:
         tp_lv_show_list("Playlists", count, v->sel, v->top, fill_playlists,
                         app, "No playlists");
+        tp_lv_set_hint("PLAY open   hold PLAY back");
+        break;
+
+    case V_ARTIST_ALBUMS:
+        snprintf(s_ui.title_buf, sizeof s_ui.title_buf, "%s",
+                 safe(v->title, "Albums"));
+        tp_lv_show_list(s_ui.title_buf, count, v->sel, v->top,
+                        fill_artist_albums, app, "No albums");
         tp_lv_set_hint("PLAY open   hold PLAY back");
         break;
 
