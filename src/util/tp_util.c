@@ -323,6 +323,34 @@ void tp_sort_tracks_by_title(struct tp_track *tracks, size_t n)
         qsort(tracks, n, sizeof(*tracks), cmp_title);
 }
 
+static int cmp_artist_entry(const void *x, const void *y)
+{
+    const struct tp_artist_entry *a = x, *b = y;
+    return tp_strcasecmp(a->name ? a->name : "", b->name ? b->name : "");
+}
+
+/* By album title first, because that is what the album list shows on its top
+   line and therefore what somebody scanning it is reading. The artist breaks
+   ties, so two records with the same title stay next to each other in a
+   predictable order rather than in load order. */
+static int cmp_album_entry(const void *x, const void *y)
+{
+    const struct tp_album_entry *a = x, *b = y;
+    int c = tp_strcasecmp(a->album ? a->album : "", b->album ? b->album : "");
+    return c ? c : tp_strcasecmp(a->artist ? a->artist : "",
+                                 b->artist ? b->artist : "");
+}
+
+void tp_sort_artists(struct tp_artist_entry *a, size_t n)
+{
+    if (a && n > 1) qsort(a, n, sizeof *a, cmp_artist_entry);
+}
+
+void tp_sort_albums(struct tp_album_entry *a, size_t n)
+{
+    if (a && n > 1) qsort(a, n, sizeof *a, cmp_album_entry);
+}
+
 void tp_sort_tracks_artist_album(struct tp_track *tracks, size_t n)
 {
     if (tracks && n)

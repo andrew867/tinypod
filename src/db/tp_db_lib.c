@@ -186,6 +186,10 @@ int tp_library_build_indexes(struct tp_library *lib)
         ensure_genre(lib, lib->tracks[i].genre);
     }
     tp_sort_tracks_artist_album(lib->tracks, lib->track_count);
+    /* The derived lists too: they were appended to in track order, which on a
+       real library is no order at all. */
+    tp_sort_artists(lib->artists, lib->artist_count);
+    tp_sort_albums(lib->albums, lib->album_count);
     return 0;
 }
 

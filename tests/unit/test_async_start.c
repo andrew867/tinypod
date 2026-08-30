@@ -66,8 +66,10 @@ int main(void)
      * a start nobody sees.
      *
      * Either of two things proves it did not pay the wait: it came back inside
-     * a frame, or it came back several times faster than the path that does
-     * wait. The second clause is not a loosening - it is the same claim
+     * a frame, or it came back in less than half the time the path that does
+     * wait took. Half, because if it were paying the wait the two would be
+     * the SAME - measured ratios run about 1:7 idle and 1:3 on a saturated
+     * machine, and never near 1:1. The second clause is not a loosening - it is the same claim
      * measured against this machine rather than against a constant. A bare
      * "under 30 ms" reads 32 then 45 on a loaded builder while the blocking
      * path it is compared against reads 151 then 182, so the thing the test
@@ -75,7 +77,7 @@ int main(void)
      * that fails for reasons unrelated to the code is one people learn to
      * ignore, and an ignored test is worse than no test.
      */
-    if (async_ms <= 30 || async_ms * 3 < sync_ms) {
+    if (async_ms <= 30 || async_ms * 2 < sync_ms) {
         printf("  ok: async start does not block the caller\n");
     } else {
         printf("  FAIL: async start blocked for %ld ms "

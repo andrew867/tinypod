@@ -51,6 +51,7 @@ enum view_kind {
     V_ALBUMS,
     V_PLAYLISTS,
     V_ARTIST_ALBUMS, /* the albums by one artist */
+    V_LETTERS,       /* initials, to jump into a long list with */
     V_TRACKS,        /* the tracks under an artist, album or playlist */
     V_NOW,
     V_SETTINGS,
@@ -93,6 +94,15 @@ struct ui {
     size_t *falbums;
     size_t  falbums_n;
     char    artist[96];
+
+    /* The initials present in the list being jumped through, and the first
+       row under each. Built once on entry: walking five hundred titles for
+       every drawn row would be quadratic, and the row filler runs for every
+       visible row on every redraw. */
+    char    letters[27];
+    int     letter_row[27];
+    int     letters_n;
+    enum view_kind letter_src;
 
     char title_buf[96];
 };
@@ -190,12 +200,101 @@ static void fill_menu(int i, struct tp_lv_row *out, void *ctx)
     }
 }
 
+/* Lists longer than this get a "jump to" row at the top. Below it the row
+   would be in the way of the thing you were already looking at. */
+#define JUMP_MIN 30
+
+/* The initial a row sorts under: a letter, or '#' for everything else. */
+static char initial_of(const char *name)
+{
+    char c;
+    if (!name || !name[0]) return '#';
+    c = name[0];
+    if (c >= 'a' && c <= 'z') return (char)(c - 'a' + 'A');
+    if (c >= 'A' && c <= 'Z') return c;
+    return '#';
+}
+
+static int raw_count(enum view_kind kind)
+{
+    struct tp_app *app = s_ui.app;
+    switch (kind) {
+    case V_SONGS:   return (int)app->lib.track_count;
+    case V_ARTISTS: return (int)app->lib.artist_count;
+    case V_ALBUMS:  return (int)app->lib.album_count;
+    default:        return 0;
+    }
+}
+
+/* The name row `i` of `kind` sorts under. */
+static const char *row_name(enum view_kind kind, int i)
+{
+    struct tp_app *app = s_ui.app;
+    switch (kind) {
+    /* The tracks are sorted by artist and then album, so the Songs list is
+       in ARTIST order and its jump has to index by artist. Indexing by title
+       would land on one match with strangers either side. */
+    case V_SONGS:   return app->lib.tracks[i].artist;
+    case V_ARTISTS: return app->lib.artists[i].name;
+    case V_ALBUMS:  return app->lib.albums[i].album;
+    default:        return NULL;
+    }
+}
+
+/* 1 when this view has a jump row above its entries, 0 otherwise. */
+static int jump_offset(enum view_kind kind)
+{
+    switch (kind) {
+    case V_SONGS:
+    case V_ARTISTS:
+    case V_ALBUMS:
+        return raw_count(kind) >= JUMP_MIN ? 1 : 0;
+    default:
+        return 0;
+    }
+}
+
+/* Collect the initials present and where each one starts. The lists are
+   already in name order, so one pass finds every boundary. */
+static void build_letters(enum view_kind kind)
+{
+    int n = raw_count(kind);
+    char last = 0;
+    int i;
+
+    s_ui.letters_n = 0;
+    s_ui.letter_src = kind;
+
+    for (i = 0; i < n && s_ui.letters_n < 27; i++) {
+        char c = initial_of(row_name(kind, i));
+        if (c == last) continue;
+        last = c;
+        s_ui.letters[s_ui.letters_n] = c;
+        s_ui.letter_row[s_ui.letters_n] = i;
+        s_ui.letters_n++;
+    }
+}
+
+/* The jump row itself, wherever a list is long enough to have one. */
+static int fill_jump(int i, struct tp_lv_row *out, enum view_kind kind)
+{
+    if (!jump_offset(kind) || i != 0) return 0;
+    out->line1 = "Jump to...";
+    out->line2 = "by first letter";
+    out->badge = NULL;
+    return 1;
+}
+
 static void fill_songs(int i, struct tp_lv_row *out, void *ctx)
 {
     struct tp_app *app = ctx;
-    struct tp_track *t = &app->lib.tracks[i];
+    struct tp_track *t;
     static char badge[8][12];
     int slot = i % 8;
+
+    if (fill_jump(i, out, V_SONGS)) return;
+    i -= jump_offset(V_SONGS);
+    t = &app->lib.tracks[i];
 
     out->line1 = safe(t->title, "Unknown title");
     out->line2 = safe(t->artist, "Unknown artist");
@@ -210,6 +309,9 @@ static void fill_artists(int i, struct tp_lv_row *out, void *ctx)
     static char badge[8][12];
     int slot = i % 8;
 
+    if (fill_jump(i, out, V_ARTISTS)) return;
+    i -= jump_offset(V_ARTISTS);
+
     out->line1 = safe(app->lib.artists[i].name, "Unknown artist");
     snprintf(badge[slot], sizeof badge[slot], "%zu",
              app->lib.artists[i].track_count);
@@ -222,10 +324,30 @@ static void fill_albums(int i, struct tp_lv_row *out, void *ctx)
     static char badge[8][12];
     int slot = i % 8;
 
+    if (fill_jump(i, out, V_ALBUMS)) return;
+    i -= jump_offset(V_ALBUMS);
+
     out->line1 = safe(app->lib.albums[i].album, "Unknown album");
     out->line2 = safe(app->lib.albums[i].artist, "Unknown artist");
     snprintf(badge[slot], sizeof badge[slot], "%zu",
              app->lib.albums[i].track_count);
+    out->badge = badge[slot];
+}
+
+/* The initials, and how far into the list each one is. */
+static void fill_letters(int i, struct tp_lv_row *out, void *ctx)
+{
+    static char name[8][4];
+    static char badge[8][12];
+    int slot = i % 8;
+    (void)ctx;
+
+    name[slot][0] = (i >= 0 && i < s_ui.letters_n) ? s_ui.letters[i] : '?';
+    name[slot][1] = 0;
+    out->line1 = name[slot];
+    out->line2 = NULL;
+    snprintf(badge[slot], sizeof badge[slot], "%d",
+             (i >= 0 && i < s_ui.letters_n) ? s_ui.letter_row[i] + 1 : 0);
     out->badge = badge[slot];
 }
 
@@ -464,9 +586,10 @@ static int view_count(struct view *v)
 
     switch (v->kind) {
     case V_MENU:      return MENU_N;
-    case V_SONGS:     return (int)app->lib.track_count;
-    case V_ARTISTS:   return (int)app->lib.artist_count;
-    case V_ALBUMS:    return (int)app->lib.album_count;
+    case V_SONGS:     return (int)app->lib.track_count + jump_offset(V_SONGS);
+    case V_ARTISTS:   return (int)app->lib.artist_count + jump_offset(V_ARTISTS);
+    case V_ALBUMS:    return (int)app->lib.album_count + jump_offset(V_ALBUMS);
+    case V_LETTERS:   return s_ui.letters_n;
     case V_PLAYLISTS: return (int)app->lib.playlist_count;
     case V_ARTIST_ALBUMS: return (int)s_ui.falbums_n;
     case V_TRACKS:    return (int)s_ui.filtered_n;
@@ -524,10 +647,31 @@ static void activate(void)
         break;
 
     case V_SONGS:
-        play_index((size_t)v->sel);
+        if (jump_offset(V_SONGS) && v->sel == 0) {
+            build_letters(V_SONGS);
+            push(V_LETTERS, 0, "Songs by artist");
+            break;
+        }
+        play_index((size_t)(v->sel - jump_offset(V_SONGS)));
         break;
 
+    case V_LETTERS: {
+        /* Land on the first entry under this initial, in the list we came
+           from - so back from here is that list, already scrolled there. */
+        int at = (v->sel >= 0 && v->sel < s_ui.letters_n)
+                     ? s_ui.letter_row[v->sel] : 0;
+        pop();
+        top_view()->sel = at + jump_offset(s_ui.letter_src);
+        break;
+    }
+
     case V_ARTISTS:
+        if (jump_offset(V_ARTISTS) && v->sel == 0) {
+            build_letters(V_ARTISTS);
+            push(V_LETTERS, 0, "Artists");
+            break;
+        }
+        v->sel -= jump_offset(V_ARTISTS);
         build_artist_albums(v->sel);
         /* One album, or none the library knows about: skip the list of one.
            A menu whose only entry is the thing you already asked for is a
@@ -552,6 +696,12 @@ static void activate(void)
         break;
 
     case V_ALBUMS:
+        if (jump_offset(V_ALBUMS) && v->sel == 0) {
+            build_letters(V_ALBUMS);
+            push(V_LETTERS, 0, "Albums");
+            break;
+        }
+        v->sel -= jump_offset(V_ALBUMS);
         build_filtered(V_ALBUMS, v->sel);
         push(V_TRACKS, v->sel, app->lib.albums[v->sel].album);
         break;
@@ -637,6 +787,14 @@ static void draw(void)
         tp_lv_show_list("Playlists", count, v->sel, v->top, fill_playlists,
                         app, "No playlists");
         tp_lv_set_hint("PLAY open   hold PLAY back");
+        break;
+
+    case V_LETTERS:
+        snprintf(s_ui.title_buf, sizeof s_ui.title_buf, "%s",
+                 safe(v->title, "Jump to"));
+        tp_lv_show_list(s_ui.title_buf, count, v->sel, v->top, fill_letters,
+                        app, "Nothing to jump to");
+        tp_lv_set_hint("PLAY jump   hold PLAY back");
         break;
 
     case V_ARTIST_ALBUMS:
@@ -785,6 +943,119 @@ static void scan_progress(const char *stage, int pct)
 }
 
 /* ---- the loop ------------------------------------------------------------- */
+
+/* ---- headless, for screenshots -------------------------------------------
+ *
+ * The same draw() and on_key() the device runs, over a display that writes to
+ * memory. The point is that the screenshots come from the real view logic
+ * with real library data rather than from a preview that fills the rows in
+ * itself - the index arithmetic behind the jump row is exactly the sort of
+ * thing that only a real list of five hundred titles will catch.
+ */
+
+static uint32_t s_shot_fb[TP_LV_W * TP_LV_H];
+
+/* Nothing to copy: the display renders straight into s_shot_fb, because that
+   is the buffer it was given. Copying out of the area pointer instead was the
+   first version, and in DIRECT mode that pointer is into the whole-screen
+   buffer rather than a packed rectangle - so it read the wrong pixels and
+   produced a picture of rows sliding over each other. */
+static void shot_flush(lv_display_t *d, const lv_area_t *a, uint8_t *px)
+{
+    (void)a; (void)px;
+    lv_display_flush_ready(d);
+}
+
+static int shot_write(const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+
+    int w = TP_LV_W, h = TP_LV_H;
+    unsigned row = (unsigned)w * 3u, pad = (4u - row % 4u) % 4u;
+    unsigned data = (row + pad) * (unsigned)h, size = 54u + data;
+    unsigned char hdr[54] = { 0 };
+
+    hdr[0] = 'B'; hdr[1] = 'M';
+    hdr[2] = (unsigned char)size; hdr[3] = (unsigned char)(size >> 8);
+    hdr[4] = (unsigned char)(size >> 16); hdr[5] = (unsigned char)(size >> 24);
+    hdr[10] = 54; hdr[14] = 40;
+    hdr[18] = (unsigned char)w; hdr[19] = (unsigned char)(w >> 8);
+    hdr[22] = (unsigned char)h; hdr[23] = (unsigned char)(h >> 8);
+    hdr[26] = 1; hdr[28] = 24;
+    fwrite(hdr, 1, sizeof hdr, f);
+
+    for (int y = h - 1; y >= 0; y--) {
+        for (int x = 0; x < w; x++) {
+            uint32_t c = s_shot_fb[y * w + x];
+            unsigned char b[3] = { (unsigned char)(c & 0xFF),
+                                   (unsigned char)((c >> 8) & 0xFF),
+                                   (unsigned char)((c >> 16) & 0xFF) };
+            fwrite(b, 1, 3, f);
+        }
+        for (unsigned i = 0; i < pad; i++) fputc(0, f);
+    }
+    fclose(f);
+    return 1;
+}
+
+int tp_lv_ui_shots(struct tp_app *app, const char *dir)
+{
+    lv_display_t *disp;
+    char path[512];
+    int made = 0;
+
+    memset(&s_ui, 0, sizeof s_ui);
+    s_ui.app = app;
+    s_ui.running = 1;
+    s_ui.stack[0].kind = V_MENU;
+
+    lv_init();
+    lv_tick_set_cb(lv_tick_ms);
+
+    disp = lv_display_create(TP_LV_W, TP_LV_H);
+    if (!disp) return 1;
+    lv_display_set_buffers(disp, s_shot_fb, NULL, sizeof s_shot_fb,
+                           LV_DISPLAY_RENDER_MODE_DIRECT);
+    lv_display_set_flush_cb(disp, shot_flush);
+
+    tp_lv_screens_init();
+
+    if (!app->loaded && tp_app_load(app) != 0) {
+        tp_error("shots: could not read the library");
+        return 1;
+    }
+
+    /* A walk through the parts worth looking at, by pressing the buttons a
+       person would press. */
+    static const struct { const char *name; const char *keys; } WALK[] = {
+        { "10-real-menu",         ""        },
+        { "11-real-songs",        "ds"      },   /* down to Songs, select */
+        { "12-real-jump",         "dss"     },   /* ...and into Jump to... */
+        { "13-real-jumped",       "dssdddds" },  /* pick a letter */
+        { "14-real-artists",      "dds"     },
+        { "15-real-artist-albums", "ddsdddddddddddddds" },
+    };
+
+    for (unsigned i = 0; i < sizeof WALK / sizeof WALK[0]; i++) {
+        /* Back to the top for each walk, so one sequence cannot leave the
+           next somewhere it did not expect. */
+        while (s_ui.depth > 0) pop();
+        s_ui.stack[0].sel = 0;
+        s_ui.stack[0].top = 0;
+
+        for (const char *k = WALK[i].keys; *k; k++)
+            on_key(*k == 'd' ? TP_LV_DOWN : *k == 'u' ? TP_LV_UP
+                                                      : TP_LV_SELECT);
+
+        draw();
+        lv_refr_now(NULL);
+
+        snprintf(path, sizeof path, "%s/%s.bmp", dir, WALK[i].name);
+        if (shot_write(path)) { printf("  %s\n", path); made++; }
+    }
+    return made ? 0 : 1;
+}
 
 int tp_lv_ui_run(struct tp_app *app, const char *fb)
 {

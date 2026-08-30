@@ -9,7 +9,16 @@
 #   make decoders             fetch third_party/helix-*
 
 TARGET ?= host
-BUILD  := build/$(TARGET)
+UI_LVGL ?= 0
+
+# The graphical build and the plain one do not share a directory.
+#
+# They used to, and the objects have different -D flags - TP_WITH_LVGL among
+# them - which the makefile does not track. So building one after the other
+# reused objects compiled for the wrong configuration, and the failure was an
+# undefined reference to a function that is right there in the source. Cheap
+# to avoid, and confusing to debug.
+BUILD  := build/$(TARGET)$(if $(filter 1,$(UI_LVGL)),-lvgl,)
 OUT    := out/$(TARGET)
 
 SRC_APP := \
@@ -74,7 +83,6 @@ CDEFS := -D_GNU_SOURCE -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 \
 #
 # The LVGL archive comes from src/ui/lvgl/Makefile.lvgl, which builds it into
 # this app's own tree. Build that first.
-UI_LVGL ?= 0
 ifeq ($(UI_LVGL),1)
   LVGL ?= ../../NanoApps/lvgl
   LVGL_LIB ?= src/ui/lvgl/build-$(TARGET)/liblvgl.a

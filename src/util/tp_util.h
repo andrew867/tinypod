@@ -38,6 +38,18 @@ int tp_json_write_bool(char *buf, size_t cap, size_t *off, int v);
 void tp_sort_tracks_by_title(struct tp_track *tracks, size_t n);
 void tp_sort_tracks_artist_album(struct tp_track *tracks, size_t n);
 
+/* The derived artist and album lists, into name order.
+ *
+ * They are built by walking the tracks and appending each new name, so
+ * without this they come out in whatever order the database handed the tracks
+ * over - which on a real library is no order at all. Nothing depends on their
+ * position: they are matched by name and their indices are used immediately
+ * and never stored. */
+struct tp_artist_entry;
+struct tp_album_entry;
+void tp_sort_artists(struct tp_artist_entry *a, size_t n);
+void tp_sort_albums(struct tp_album_entry *a, size_t n);
+
 uint64_t tp_time_ms_now(void);
 
 #endif

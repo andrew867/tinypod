@@ -22,4 +22,8 @@ struct tp_app;
  */
 int tp_lv_ui_run(struct tp_app *app, const char *fb);
 
+/* Render a walk through the real UI, against a real library, to BMPs in
+   `dir`. Same draw() and on_key() as the device; no framebuffer needed. */
+int tp_lv_ui_shots(struct tp_app *app, const char *dir);
+
 #endif

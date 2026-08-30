@@ -187,6 +187,18 @@ int main(int argc, char **argv)
         if (!app.loaded)
             tp_app_load(&app);
         rc = tp_ui_fb_run(&app);
+    } else if (strcmp(cmd, "gui-shots") == 0) {
+#ifdef TP_WITH_LVGL
+        /* Render the graphical UI to BMPs without a framebuffer, driven the
+           way a person drives it. Against a real volume this is the only
+           thing that exercises the view logic - index shifts, the letter
+           index - with a library big enough for it to matter. */
+        /* cmd = argv[i++] above, so i already points past the command. */
+        rc = tp_lv_ui_shots(&app, i < argc ? argv[i] : "shots");
+#else
+        fprintf(stderr, "This build has no graphical UI.\n");
+        rc = 2;
+#endif
     } else if (strcmp(cmd, "gui") == 0) {
 #ifdef TP_WITH_LVGL
         if (!app.loaded)
