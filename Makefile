@@ -132,6 +132,10 @@ n31:
 decoders:
 	@test -f $(HELIX_AAC_DIR)/aacdec.c && test -f $(HELIX_MP3_DIR)/mp3dec.c || \
 		./tools/fetch-decoders.sh
+	@# third_party is fetched rather than vendored, so a fix made in it is lost
+	@# on the next fetch. This re-applies the one mingw needs, and is
+	@# idempotent, so running it every time costs nothing.
+	@./tools/patch-decoders.sh
 
 dirs:
 	@mkdir -p $(BUILD) $(OUT) $(BUILD)/util $(BUILD)/fs $(BUILD)/db \
