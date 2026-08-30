@@ -26,6 +26,7 @@ enum ui_screen {
     UI_ARTISTS,
     UI_ALBUMS,
     UI_PLAYLISTS,
+    UI_TRACKS,         /* the tracks under one artist, album or playlist */
     UI_NOW,
     UI_SETTINGS,
     UI_ABOUT
@@ -37,7 +38,109 @@ struct ui_state {
     int sel;
     int running;
     int was_playing;   /* to spot a track ending by itself */
+
+    /*
+     * The drill-down. Selecting an artist or an album used to do nothing at
+     * all - activate() had no case for either - so those two lists were
+     * signposts to rooms with no doors, and a playlist could only ever play
+     * its first track.
+     *
+     * `filtered` holds indices into lib.tracks, built once on entry rather
+     * than filtered per row. One level is enough: everything reachable from
+     * the home menu is a list and then its tracks, so a full view stack would
+     * be machinery for a depth that does not exist.
+     */
+    size_t *filtered;
+    size_t  filtered_n;
+    char    title[160];
+    enum ui_screen back_to;
+    int     back_sel;
 };
+
+static void filtered_free(struct ui_state *ui)
+{
+    free(ui->filtered);
+    ui->filtered = NULL;
+    ui->filtered_n = 0;
+}
+
+static int str_same(const char *a, const char *b)
+{
+    if (!a || !b)
+        return a == b;
+    return strcmp(a, b) == 0;
+}
+
+/* Tracks belonging to the selected artist, album or playlist. */
+static void build_filtered(struct ui_state *ui, enum ui_screen from, int which)
+{
+    struct tp_app *app = ui->app;
+    size_t i, n = 0;
+
+    filtered_free(ui);
+
+    if (from == UI_PLAYLISTS) {
+        struct tp_playlist *pl = &app->lib.playlists[which];
+        ui->filtered = calloc(pl->track_count ? pl->track_count : 1,
+                              sizeof *ui->filtered);
+        if (!ui->filtered)
+            return;
+        /* Playlist order, not library order - that is the point of one. */
+        for (i = 0; i < pl->track_count; i++) {
+            size_t j;
+            for (j = 0; j < app->lib.track_count; j++) {
+                if (app->lib.tracks[j].track_id == pl->track_ids[i]) {
+                    ui->filtered[n++] = j;
+                    break;
+                }
+            }
+        }
+        ui->filtered_n = n;
+        snprintf(ui->title, sizeof ui->title, "%s",
+                 pl->name ? pl->name : "?");
+        return;
+    }
+
+    ui->filtered = calloc(app->lib.track_count ? app->lib.track_count : 1,
+                          sizeof *ui->filtered);
+    if (!ui->filtered)
+        return;
+
+    for (i = 0; i < app->lib.track_count; i++) {
+        struct tp_track *t = &app->lib.tracks[i];
+        if (from == UI_ARTISTS) {
+            if (str_same(t->artist, app->lib.artists[which].name))
+                ui->filtered[n++] = i;
+        } else {
+            struct tp_album_entry *a = &app->lib.albums[which];
+            /* album_artist as well as artist, or a compilation shows one
+               track and hides the rest of its own album. */
+            if (str_same(t->album, a->album) &&
+                (str_same(t->artist, a->artist) ||
+                 str_same(t->album_artist, a->artist)))
+                ui->filtered[n++] = i;
+        }
+    }
+    ui->filtered_n = n;
+
+    if (from == UI_ARTISTS)
+        snprintf(ui->title, sizeof ui->title, "%s",
+                 app->lib.artists[which].name);
+    else
+        snprintf(ui->title, sizeof ui->title, "%s - %s",
+                 app->lib.albums[which].artist,
+                 app->lib.albums[which].album);
+}
+
+/* Enter the track list for row `which` of the list we are on. */
+static void drill_in(struct ui_state *ui, enum ui_screen from, int which)
+{
+    build_filtered(ui, from, which);
+    ui->back_to = from;
+    ui->back_sel = which;
+    ui->screen = UI_TRACKS;
+    ui->sel = 0;
+}
 
 static void draw_term(struct ui_state *ui)
 {
@@ -82,6 +185,16 @@ static void draw_term(struct ui_state *ui)
             printf("  %s %s (%zu)\n", (int)i == ui->sel ? ">" : " ",
                    ui->app->lib.playlists[i].name, ui->app->lib.playlists[i].track_count);
         break;
+    case UI_TRACKS:
+        printf("%s (%zu)\n", ui->title, ui->filtered_n);
+        if (!ui->filtered_n)
+            printf("  (no tracks)\n");
+        for (i = 0; i < ui->filtered_n && i < 20; i++) {
+            struct tp_track *t = &ui->app->lib.tracks[ui->filtered[i]];
+            printf("  %s %s\n", (int)i == ui->sel ? ">" : " ",
+                   t->title ? t->title : "?");
+        }
+        break;
     case UI_NOW:
         printf("Now Playing\n");
         tp_app_cmd_status(ui->app);
@@ -125,11 +238,23 @@ static void activate(struct ui_state *ui)
             tp_app_cmd_play_id(ui->app, ui->app->lib.tracks[idx].track_id) == 0)
             ui->was_playing = 1;
         ui->screen = UI_NOW;
+    } else if (ui->screen == UI_ARTISTS && ui->app->lib.artist_count) {
+        if ((size_t)ui->sel < ui->app->lib.artist_count)
+            drill_in(ui, UI_ARTISTS, ui->sel);
+    } else if (ui->screen == UI_ALBUMS && ui->app->lib.album_count) {
+        if ((size_t)ui->sel < ui->app->lib.album_count)
+            drill_in(ui, UI_ALBUMS, ui->sel);
     } else if (ui->screen == UI_PLAYLISTS && ui->app->lib.playlist_count) {
+        /* Into the playlist, not straight into its first track. Playing track
+           one was the only thing a playlist could do, which left the rest of
+           it unreachable. */
+        if ((size_t)ui->sel < ui->app->lib.playlist_count)
+            drill_in(ui, UI_PLAYLISTS, ui->sel);
+    } else if (ui->screen == UI_TRACKS && ui->filtered_n) {
         size_t idx = (size_t)ui->sel;
-        if (idx < ui->app->lib.playlist_count &&
-            ui->app->lib.playlists[idx].track_count > 0 &&
-            tp_app_cmd_play_id(ui->app, ui->app->lib.playlists[idx].track_ids[0]) == 0)
+        if (idx < ui->filtered_n &&
+            tp_app_cmd_play_id(ui->app,
+                ui->app->lib.tracks[ui->filtered[idx]].track_id) == 0)
             ui->was_playing = 1;
         ui->screen = UI_NOW;
     }
@@ -143,6 +268,7 @@ static int max_sel(struct ui_state *ui)
     case UI_ARTISTS: return (int)ui->app->lib.artist_count - 1;
     case UI_ALBUMS: return (int)ui->app->lib.album_count - 1;
     case UI_PLAYLISTS: return (int)ui->app->lib.playlist_count - 1;
+    case UI_TRACKS: return (int)ui->filtered_n - 1;
     default: return 0;
     }
 }
@@ -213,11 +339,18 @@ int tp_ui_fb_run(struct tp_app *app)
         if (st == TP_PLAYER_PLAYING)
             ui.was_playing = 1;
 
-        /* Back on the home screen leaves; anywhere else it goes home. Quit
-           leaves from wherever you are. */
+        /* Back goes up ONE level, not straight home. From a track list that
+           is the list you drilled in from, with the row you came from still
+           selected - dropping to the home menu from three taps deep is how
+           browsing a library becomes tedious. Back on the home screen leaves;
+           quit leaves from wherever you are. */
         if (k == TP_KEY_QUIT || k == TP_KEY_BACK || k == TP_KEY_LEFT) {
             if (k == TP_KEY_QUIT || ui.screen == UI_HOME) {
                 ui.running = 0;
+            } else if (ui.screen == UI_TRACKS) {
+                filtered_free(&ui);
+                ui.screen = ui.back_to;
+                ui.sel = ui.back_sel;
             } else {
                 ui.screen = UI_HOME;
                 ui.sel = 0;

@@ -33,6 +33,16 @@
    a keypress. Everything else is static until you press something. */
 #define NOW_TICK_MS 500
 
+/* A track that played for less than this did not play. Generous enough that a
+   genuinely short file is not mistaken for a failure, short enough that three
+   of them in a row is unmistakably a device problem rather than a library. */
+#define TP_TOO_SHORT_MS   1500
+
+/* How many of those in a row before the queue stops and says so. Three rather
+   than one, because a single unplayable file among many is worth skipping -
+   it is the run that means the device is gone. */
+#define TP_FAIL_RUN_MAX   3
+
 enum view_kind {
     V_MENU = 0,
     V_SONGS,
@@ -694,12 +704,50 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
          */
         if (s_ui.was_playing &&
             tp_player_state(app->player) == TP_PLAYER_STOPPED) {
+            const char *e = tp_player_last_error(app->player);
+
             s_ui.was_playing = 0;
-            if (app->queue.count > 0 && tp_app_cmd_next(app) == 0)
-                s_ui.was_playing = 1;
-            redraw = 1;
+
+            /*
+             * A track that FAILED is not a track that finished, and which one
+             * it was decides whether to move on.
+             *
+             * This used to advance on stopped alone. With a working device
+             * those are the same thing; with a broken one they are not. The
+             * sink fails to open, the track stops instantly, the queue steps
+             * to the next, and the app walks the whole library in a few
+             * seconds saying nothing - which is exactly what was reported.
+             *
+             * So an error stops the queue and stays on screen. And a run of
+             * tracks that each end immediately is a broken device rather than
+             * a run of empty files, so that stops too: a sink that fails
+             * without setting a message would otherwise gallop just as
+             * silently.
+             */
+            if (e && e[0]) {
+                s_ui.fail_run = 0;
+                redraw = 1;              /* Now Playing shows it; do not advance */
+            } else {
+                if (tp_player_position_ms(app->player) < TP_TOO_SHORT_MS)
+                    s_ui.fail_run++;
+                else
+                    s_ui.fail_run = 0;
+
+                if (s_ui.fail_run >= TP_FAIL_RUN_MAX) {
+                    tp_lv_show_message(
+                        "Playback stopped",
+                        "Several tracks ended immediately.\n\n"
+                        "The audio device is most likely refusing output. "
+                        "The files themselves are probably fine.");
+                } else if (app->queue.count > 0 &&
+                           tp_app_cmd_next(app) == 0) {
+                    s_ui.was_playing = 1;
+                }
+                redraw = 1;
+            }
         } else if (tp_player_state(app->player) == TP_PLAYER_PLAYING) {
             s_ui.was_playing = 1;
+            s_ui.fail_run = 0;
         }
 
         /* Now Playing has a clock on it and must tick without a keypress. */
