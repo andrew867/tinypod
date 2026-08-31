@@ -12,6 +12,8 @@ rebuild a database, and never writes anything under `iPod_Control`.
   `Music/Fxx` with tag parsing
 - In-process decoding: Helix fixed-point AAC (including HE-AAC/SBR), MP3, and
   WAV. No external player process is required, and the N31 initramfs has none
+- Optional FFmpeg backend for everything else — FLAC, Vorbis, Opus, ALAC, WMA,
+  WavPack, Musepack, TTA, AC3 and the rest. See [Wide format support](#wide-format-support)
 - Its own MP4/M4A demuxer, so iTunes-synced `.m4a` files play unmodified
 - Three interfaces: a command line, a terminal UI, and a graphical UI on the
   framebuffer
@@ -52,8 +54,9 @@ the makefile does not track flags.
 The Helix decoders are RealNetworks code under the RPSL/RCSL, so they are
 fetched at build time rather than vendored. See
 [tools/fetch-decoders.sh](tools/fetch-decoders.sh) to point the build at a
-different source. The decoders must be fixed-point: the N31 is ARMv7 with
-soft-float ABI.
+different source. The N31 is a Cortex-A8 with VFPv3-D16, built here with
+`-mfloat-abi=softfp` — hardware floating point, with arguments passed in
+integer registers as this eabi toolchain expects.
 
 In the ipod tree, `tools/linux-n31/build-n31-tinypod.sh` performs the above and
 stages the binary for the initramfs and for the disk.
@@ -118,6 +121,39 @@ tinypod --mount /path/to/volume gui-shots <dir>
 Renders the graphical UI to BMPs without a framebuffer, driving the same draw
 and key-handling code the device runs. Pointed at a real library, this
 exercises the view logic rather than the widgets alone.
+
+## Wide format support
+
+`FFMPEG=1` links a minimal, audio-only FFmpeg — libavcodec, libavformat,
+libswresample, libavutil — built by `tools/fetch-ffmpeg.sh`. Everything is
+disabled and the audio pieces switched back on, so what gets linked is the
+decoders and demuxers a music library actually contains, not the whole
+project.
+
+```sh
+./tools/fetch-ffmpeg.sh                     # host libraries, ~4.0 MB
+CROSS=<prefix> ./tools/fetch-ffmpeg.sh      # device libraries, ~3.3 MB
+make FFMPEG=1 ...
+```
+
+AAC and MP3 still go through the Helix fixed-point decoders. They are proven
+on this device and allocate almost nothing, and they are what an
+iTunes-synced library is made of; FFmpeg is the fallback for the formats that
+would otherwise refuse to open. An `.m4a` holding Apple Lossless falls through
+to it too, rather than being rejected on the container's codec.
+
+Off by default. With `FFMPEG=0` the source file is not compiled, the libraries
+are not linked, and the fallback branch does not exist.
+
+### Two device builds
+
+The device binary is 1.97 MB without FFmpeg and 4.44 MB with it. The
+initramfs is a tmpfs, so everything in it holds system RAM for the whole
+session, and this machine has 55 MiB. The wide build is therefore staged
+separately as `tinypod-full`, installed to the volume, and left out of the
+initramfs; `n31-autostart` searches the disk before `/bin`, so the wide build
+runs whenever the volume is mounted and the lean one still starts when it is
+not.
 
 ## Documentation
 

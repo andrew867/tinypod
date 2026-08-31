@@ -1,4 +1,7 @@
 #include "tp_decode.h"
+#ifdef TP_WITH_FFMPEG
+#include "tp_dec_ff.h"
+#endif
 #include "tp_mp4.h"
 
 #include "aacdec.h"
@@ -19,10 +22,18 @@ enum dec_kind {
     DEC_AAC_ADTS,
     DEC_MP3,
     DEC_WAV
+#ifdef TP_WITH_FFMPEG
+    /* Only when the backend is built in, so the switch over this enum is
+       exhaustive either way and -Werror=switch stays useful. */
+    , DEC_FFMPEG
+#endif
 };
 
 struct tp_dec {
     enum dec_kind kind;
+#ifdef TP_WITH_FFMPEG
+    struct tp_ff *ff;
+#endif
     int rate;
     int channels;
     uint64_t duration_ms;
@@ -422,6 +433,9 @@ static int decode_block(struct tp_dec *d, int16_t *out)
     case DEC_AAC_ADTS: return aac_adts_block(d, out);
     case DEC_MP3:      return mp3_block(d, out);
     case DEC_WAV:      return wav_block(d, out);
+#ifdef TP_WITH_FFMPEG
+    case DEC_FFMPEG:   return tp_ff_read(d->ff, out, TP_DEC_MAX_BLOCK);
+#endif
     }
     return -1;
 }
@@ -447,6 +461,34 @@ struct tp_dec *tp_dec_open(const char *path, char *err, size_t errsz)
             return NULL;
         }
         if (!tp_mp4_is_aac(d->mp4)) {
+#ifdef TP_WITH_FFMPEG
+            /*
+             * An MP4 that is not AAC - Apple Lossless, most often, which an
+             * iPod library is full of. This branch is entered on the
+             * extension, so refusing here meant never reaching the decoder
+             * that handles it. Hand the file over instead; FFmpeg reads the
+             * container rather than deciding from the name.
+             */
+            char fferr[128] = "";
+            struct tp_ff *ff = tp_ff_open(path, fferr, sizeof(fferr));
+
+            tp_mp4_close(d->mp4);
+            d->mp4 = NULL;
+
+            if (!ff) {
+                fail(err, errsz, "%s",
+                     fferr[0] ? fferr : "unsupported MP4 codec");
+                tp_dec_close(d);
+                return NULL;
+            }
+            d->kind = DEC_FFMPEG;
+            d->ff = ff;
+            d->rate = tp_ff_rate(ff);
+            d->channels = tp_ff_channels(ff);
+            d->duration_ms = tp_ff_duration_ms(ff);
+            snprintf(d->codec, sizeof(d->codec), "%s", tp_ff_codec_name(ff));
+            goto primed;
+#else
             const char *c = tp_mp4_codec(d->mp4);
             if (strcmp(c, "alac") == 0)
                 fail(err, errsz, "Apple Lossless is not supported by this build");
@@ -454,6 +496,7 @@ struct tp_dec *tp_dec_open(const char *path, char *err, size_t errsz)
                 fail(err, errsz, "unsupported MP4 codec '%s'", c);
             tp_dec_close(d);
             return NULL;
+#endif
         }
         d->aac = AACInitDecoder();
         if (!d->aac) {
@@ -495,7 +538,12 @@ struct tp_dec *tp_dec_open(const char *path, char *err, size_t errsz)
             return NULL;
         }
         snprintf(d->codec, sizeof(d->codec), "WAV");
-    } else {
+    } else if (ext_is(path, "mp3") || ext_is(path, "mp2") ||
+               ext_is(path, "mpga")) {
+        /* Named, not the catch-all it used to be. Everything unrecognised
+           went to the MP3 decoder, which was reasonable when MP3 was the last
+           thing left to try; what is left to try now identifies the file
+           itself rather than guessing from its name. */
         d->kind = DEC_MP3;
         d->f = fopen(path, "rb");
         if (!d->f) {
@@ -519,6 +567,40 @@ struct tp_dec *tp_dec_open(const char *path, char *err, size_t errsz)
         snprintf(d->codec, sizeof(d->codec), "MP3");
     }
 
+#ifdef TP_WITH_FFMPEG
+    else {
+        /*
+         * Anything the built-in decoders do not claim. FFmpeg opens the file,
+         * finds the audio stream and reports the rate and channel count
+         * itself, so the priming below has nothing to settle - it runs anyway
+         * so that a file which opens but cannot be decoded still fails here
+         * rather than after the UI has said it is playing.
+         */
+        char fferr[128] = "";
+
+        d->kind = DEC_FFMPEG;
+        d->ff = tp_ff_open(path, fferr, sizeof(fferr));
+        if (!d->ff) {
+            fail(err, errsz, "%s", fferr[0] ? fferr : "unsupported file");
+            tp_dec_close(d);
+            return NULL;
+        }
+        d->rate = tp_ff_rate(d->ff);
+        d->channels = tp_ff_channels(d->ff);
+        d->duration_ms = tp_ff_duration_ms(d->ff);
+        snprintf(d->codec, sizeof(d->codec), "%s", tp_ff_codec_name(d->ff));
+    }
+#else
+    else {
+        fail(err, errsz, "unsupported file type");
+        tp_dec_close(d);
+        return NULL;
+    }
+#endif
+
+#ifdef TP_WITH_FFMPEG
+primed:
+#endif
     /*
      * Decode the first block now. That settles rate and channel count for
      * good - with HE-AAC the output rate is twice the container's - and it
@@ -561,6 +643,12 @@ void tp_dec_close(struct tp_dec *d)
 {
     if (!d)
         return;
+#ifdef TP_WITH_FFMPEG
+    if (d->ff) {
+        tp_ff_close(d->ff);
+        d->ff = NULL;
+    }
+#endif
     if (d->aac)
         AACFreeDecoder(d->aac);
     if (d->mp3)

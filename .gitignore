@@ -27,3 +27,7 @@ tinypod
 # LVGL UI build trees and rendered screens
 src/ui/lvgl/build-*/
 src/ui/lvgl/shots/
+third_party/ffmpeg-*/
+third_party/ffmpeg-build/
+third_party/ffmpeg-*.tar.xz
+testdata/formats/

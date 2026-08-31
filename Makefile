@@ -18,7 +18,7 @@ UI_LVGL ?= 0
 # reused objects compiled for the wrong configuration, and the failure was an
 # undefined reference to a function that is right there in the source. Cheap
 # to avoid, and confusing to debug.
-BUILD  := build/$(TARGET)$(if $(filter 1,$(UI_LVGL)),-lvgl,)
+BUILD  := build/$(TARGET)$(if $(filter 1,$(UI_LVGL)),-lvgl,)$(if $(filter 1,$(FFMPEG)),-ff,)
 OUT    := out/$(TARGET)
 
 SRC_APP := \
@@ -95,6 +95,30 @@ ifeq ($(UI_LVGL),1)
 	-DLV_CONF_PATH='"lv_conf_tp.h"'
 endif
 
+# FFmpeg, for everything the Helix decoders do not cover: FLAC, Vorbis, Opus,
+# ALAC, WMA, Musepack, AC3 and the rest.
+#
+#   ./tools/fetch-ffmpeg.sh                              host libraries
+#   CROSS=<prefix> ./tools/fetch-ffmpeg.sh               device libraries
+#   make FFMPEG=1 ...
+#
+# Off by default. AAC and MP3 keep going through Helix either way - this is
+# the fallback for formats that otherwise refuse to open, not a replacement
+# for the path that already works on the device.
+FFMPEG ?= 0
+ifeq ($(FFMPEG),1)
+  FFMPEG_DIR ?= third_party/ffmpeg-build/$(TARGET)
+  SRC_APP += src/codec/tp_dec_ff.c
+  INCLUDES += -I$(FFMPEG_DIR)/include
+  CDEFS += -DTP_WITH_FFMPEG=1
+  # Order matters to a static link: avformat needs avcodec, which needs
+  # swresample and avutil.
+  FFMPEG_LIBS := $(FFMPEG_DIR)/lib/libavformat.a \
+                 $(FFMPEG_DIR)/lib/libavcodec.a \
+                 $(FFMPEG_DIR)/lib/libswresample.a \
+                 $(FFMPEG_DIR)/lib/libavutil.a
+endif
+
 # tinyalsa: point at an unpacked tinyalsa tree to get real audio output.
 # Without it the build still decodes (see the "decode" command) but cannot play.
 TINYALSA_DIR ?=
@@ -109,16 +133,26 @@ ifeq ($(TARGET),n31)
   CC := $(CROSS)gcc
   # armv7-a: Helix AAC's fast path uses ssat (ARMv6+), and -DARM selects the
   # smull inline assembly in Helix MP3.
-  ARCH := -march=armv7-a
+  #
+  # And the floating-point unit the device actually has. This used to be
+  # -march=armv7-a alone, so GCC assumed no FPU and put every float operation
+  # through a soft-float library call. The Helix decoders are fixed-point and
+  # did not care, which is why it went unnoticed; FFmpeg's decoders are mostly
+  # float and would have cared a great deal.
+  #
+  # softfp is the ABI, not the arithmetic: FP instructions are generated and
+  # arguments are passed in integer registers, which is what this eabi (not
+  # eabihf) toolchain wants. The same flags every other app here uses.
+  ARCH := -mcpu=cortex-a8 -mfpu=vfpv3-d16 -mfloat-abi=softfp
   CFLAGS := -Os $(ARCH) -static $(WARN) $(INCLUDES) $(CDEFS) -DTINYPOD_N31
   DECFLAGS := -O2 $(ARCH) -DARM $(INCLUDES) $(CDEFS)
-  LDFLAGS := -static $(TINYALSA_LIB) $(LVGL_LIB) -lpthread -ldl -lm
+  LDFLAGS := -static $(TINYALSA_LIB) $(LVGL_LIB) $(FFMPEG_LIBS) -lpthread -ldl -lm
 else
   CC ?= gcc
   ARCH :=
   CFLAGS := -O2 -g $(WARN) $(INCLUDES) $(CDEFS)
   DECFLAGS := -O2 $(INCLUDES) $(CDEFS)
-  LDFLAGS := $(TINYALSA_LIB) $(LVGL_LIB) -lpthread -ldl -lm
+  LDFLAGS := $(TINYALSA_LIB) $(LVGL_LIB) $(FFMPEG_LIBS) -lpthread -ldl -lm
 endif
 
 APP_OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRC_APP))
@@ -176,9 +210,19 @@ IPOD_ARTIFACTS ?= /mnt/c/src/ipod/artifacts/linux-n31
 $(OUT)/tinypod: $(APP_OBJS) $(SQLITE_OBJ) $(DEC_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 	@# Device builds only: the host binary is not what gets packed.
+	@#
+	@# The wide build is staged under a different name. The initramfs is a
+	@# tmpfs, so everything in it holds system RAM for the whole session, and
+	@# FFmpeg takes this binary from 2 MB to 4.4 MB - five per cent of the
+	@# machine, permanently, for decoders most tracks never reach. The disk
+	@# pages on demand and has fifteen gigabytes, so the wide build goes
+	@# there and the lean one stays in RAM. n31-autostart searches the disk
+	@# first, so the wide one runs whenever the volume is mounted and the
+	@# lean one still starts when it is not.
 	@if [ "$(TARGET)" = "n31" ] && [ -d "$(IPOD_ARTIFACTS)" ]; then \
-		cp -f $@ $(IPOD_ARTIFACTS)/tinypod && \
-		echo "  staged -> $(IPOD_ARTIFACTS)/tinypod"; \
+		name=$(if $(filter 1,$(FFMPEG)),tinypod-full,tinypod); \
+		cp -f $@ $(IPOD_ARTIFACTS)/$$name && \
+		echo "  staged -> $(IPOD_ARTIFACTS)/$$name"; \
 	fi
 
 $(BUILD)/%.o: src/%.c
