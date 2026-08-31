@@ -25,6 +25,7 @@ SRC_APP := \
 	src/main.c \
 	src/tp_app.c \
 	src/util/tp_build.c \
+	src/util/tp_diag.c \
 	src/util/tp_log.c \
 	src/util/tp_util.c \
 	src/util/tp_config.c \

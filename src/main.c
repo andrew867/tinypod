@@ -1,4 +1,5 @@
 #include "tp_app.h"
+#include "util/tp_diag.h"
 #include "util/tp_build.h"
 #ifdef TP_WITH_LVGL
 #include "tp_lv_ui.h"
@@ -44,6 +45,10 @@ int tp_ui_fb_run(struct tp_app *app);
 
 int main(int argc, char **argv)
 {
+    /* Before anything else, so a crash in argument handling or in the very
+       first allocation still leaves a trail. */
+    tp_diag_begin();
+
     const char *mount = NULL;
     const char *backend_name = NULL;
     int no_wait = 0;
@@ -195,8 +200,13 @@ int main(int argc, char **argv)
     } else if (strcmp(cmd, "status") == 0) {
         rc = tp_app_cmd_status(&app);
     } else if (strcmp(cmd, "ui") == 0) {
+        /* Return value deliberately ignored: a library that will not read
+           is something to show, not a reason to exit before drawing. The
+           graphical command has always worked this way; this one used to as
+           well by accident, and now does so on purpose. */
         if (!app.loaded)
-            tp_app_load(&app);
+            (void)tp_app_load(&app);
+        tp_diag_stage("terminal UI");
         rc = tp_ui_fb_run(&app);
     } else if (strcmp(cmd, "gui-shots") == 0) {
 #ifdef TP_WITH_LVGL
@@ -213,7 +223,8 @@ int main(int argc, char **argv)
     } else if (strcmp(cmd, "gui") == 0) {
 #ifdef TP_WITH_LVGL
         if (!app.loaded)
-            tp_app_load(&app);
+            (void)tp_app_load(&app);
+        tp_diag_stage("graphical UI");
         rc = tp_lv_ui_run(&app, NULL);
 #else
         fprintf(stderr,

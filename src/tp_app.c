@@ -1,4 +1,5 @@
 #include "tp_app.h"
+#include "util/tp_diag.h"
 #include "tp_decode.h"
 #include "tp_sink.h"
 #include "tp_util.h"
@@ -22,6 +23,7 @@ int tp_app_init(struct tp_app *app, const char *mount, enum tp_player_backend ba
     app->player = tp_player_create(backend);
     if (!app->player)
         return -1;
+    tp_diag_stage("detecting the volume");
     if (tp_mount_detect(mount, &app->vol) != 0) {
         tp_error("Could not find an iPod volume.\n"
                  "Pass --mount /path (volume root or iPod_Control),\n"
@@ -74,8 +76,10 @@ int tp_app_load(struct tp_app *app)
         tp_library_free(&app->lib);
         tp_library_init(&app->lib);
     }
+    tp_diag_stage("reading the database");
     rc = tp_db_load(&app->lib, app->vol.mount_root, app->vol.ipod_control_root,
                     TP_DB_FORMAT_UNKNOWN);
+    tp_diag_stage("database read");
     if (rc != 0) {
         /* With no volume there is no path to name, and printing
            "(null)" reads like a bug in the loader rather than a disk
@@ -87,6 +91,7 @@ int tp_app_load(struct tp_app *app)
         return -1;
     }
     app->loaded = 1;
+    tp_diag_stage("library ready");
 
     {
         char msg[96];
