@@ -111,15 +111,20 @@ static struct ui s_ui;
 
 /* ---- the home menu -------------------------------------------------------- */
 
+/*
+ * Shuffle All first, because it is the one row that needs no decision, and
+ * no captions: a row on a 240-pixel panel is worth more than a sentence
+ * telling you what "Songs" contains.
+ */
 static const struct {
     const char *name;
     const char *sub;
 } k_menu[] = {
-    { "Songs",       "Everything, by title" },
+    { "Shuffle All", NULL },
+    { "Songs",       NULL },
     { "Artists",     NULL },
     { "Albums",      NULL },
     { "Playlists",   NULL },
-    { "Shuffle All", "Play the library at random" },
     { "Now Playing", NULL },
     { "Settings",    NULL },
     { "About",       NULL },
@@ -186,16 +191,18 @@ static void fill_menu(int i, struct tp_lv_row *out, void *ctx)
     out->line2 = k_menu[i].sub;
 
     /* The counts are the useful part: "Artists 214" saves opening it to find
-       out there are none. */
+       out there are none. These follow k_menu, and moving Shuffle All to the
+       top without moving them put the track count under Shuffle All and the
+       artist count under Songs. */
     switch (i) {
-    case 0: snprintf(sub[0], sizeof sub[0], "%zu tracks", app->lib.track_count);
-            out->line2 = sub[0]; break;
-    case 1: snprintf(sub[1], sizeof sub[1], "%zu", app->lib.artist_count);
+    case 1: snprintf(sub[1], sizeof sub[1], "%zu tracks", app->lib.track_count);
             out->line2 = sub[1]; break;
-    case 2: snprintf(sub[2], sizeof sub[2], "%zu", app->lib.album_count);
+    case 2: snprintf(sub[2], sizeof sub[2], "%zu", app->lib.artist_count);
             out->line2 = sub[2]; break;
-    case 3: snprintf(sub[3], sizeof sub[3], "%zu", app->lib.playlist_count);
+    case 3: snprintf(sub[3], sizeof sub[3], "%zu", app->lib.album_count);
             out->line2 = sub[3]; break;
+    case 4: snprintf(sub[4], sizeof sub[4], "%zu", app->lib.playlist_count);
+            out->line2 = sub[4]; break;
     default: break;
     }
 }
@@ -401,12 +408,33 @@ static void fill_settings(int i, struct tp_lv_row *out, void *ctx)
         snprintf(v[0], sizeof v[0], "%s", app->cfg.shuffle ? "On" : "Off");
         out->line2 = v[0];
         break;
-    case 1:
+    case 1: {
+        /*
+         * The backend, what the device gave us, and how often it has had to
+         * restart. The last of those is the one worth having: an underrun is
+         * silent from the application's side, and on this codec each one
+         * costs a 60 ms settle - so a stream restarting several times a
+         * second sounds broken with nothing anywhere saying why.
+         */
+        char desc[32] = "";
+        unsigned long n = tp_player_restarts(app->player);
+        const char *what;
+
         out->line1 = "Audio backend";
-        snprintf(v[1], sizeof v[1], "%s",
-                 tp_player_backend_name(app->backend));
+        tp_player_sink_desc(app->player, desc, sizeof desc);
+        what = desc[0] ? desc : tp_player_backend_name(app->backend);
+
+        /* Widths are bounded so the row cannot be truncated mid-word: the
+           description is the part worth keeping whole, and a dropout count
+           past four digits says the same thing as one at four. */
+        if (n)
+            snprintf(v[1], sizeof v[1], "%.24s, %u dropouts", what,
+                     n > 9999ul ? 9999u : (unsigned)n);
+        else
+            snprintf(v[1], sizeof v[1], "%.40s", what);
         out->line2 = v[1];
         break;
+    }
     case 2:
         out->line1 = "Library source";
         snprintf(v[2], sizeof v[2], "%zu tracks", app->lib.track_count);
@@ -414,7 +442,7 @@ static void fill_settings(int i, struct tp_lv_row *out, void *ctx)
         break;
     default:
         out->line1 = "Stop playback";
-        out->line2 = "Ends the current track";
+        out->line2 = NULL;
         break;
     }
 }
@@ -627,12 +655,9 @@ static void activate(void)
 
     switch (v->kind) {
     case V_MENU:
+        /* These follow k_menu above, in its order. */
         switch (v->sel) {
-        case 0: push(V_SONGS, 0, NULL); break;
-        case 1: push(V_ARTISTS, 0, NULL); break;
-        case 2: push(V_ALBUMS, 0, NULL); break;
-        case 3: push(V_PLAYLISTS, 0, NULL); break;
-        case 4:
+        case 0:
             app->cfg.shuffle = 1;
             tp_queue_from_library(&app->queue, &app->lib, 1);
             if (app->queue.count &&
@@ -640,6 +665,10 @@ static void activate(void)
                 s_ui.was_playing = 1;
             push(V_NOW, 0, NULL);
             break;
+        case 1: push(V_SONGS, 0, NULL); break;
+        case 2: push(V_ARTISTS, 0, NULL); break;
+        case 3: push(V_ALBUMS, 0, NULL); break;
+        case 4: push(V_PLAYLISTS, 0, NULL); break;
         case 5: push(V_NOW, 0, NULL); break;
         case 6: push(V_SETTINGS, 0, NULL); break;
         default: push(V_ABOUT, 0, NULL); break;
@@ -883,13 +912,7 @@ static void draw(void)
            old copy on the device is indistinguishable from a fresh one
            without it. */
         static char about[256];
-        snprintf(about, sizeof about,
-                 "TinyPod\n\n"
-                 "Read-only iPod music\n"
-                 "for N31 Linux.\n\n"
-                 "Nothing under iPod_Control\n"
-                 "is ever written.\n\n"
-                 "%s", tp_build_version());
+        snprintf(about, sizeof about, "TinyPod\n\n%s", tp_build_version());
         tp_lv_show_message("About", about);
         tp_lv_set_hint("hold PLAY back");
         break;
@@ -1037,27 +1060,28 @@ int tp_lv_ui_shots(struct tp_app *app, const char *dir)
      * A walk through the parts worth looking at, by pressing the buttons a
      * person would press.
      *
-     * The home menu is Songs, Artists, Albums, Playlists, Shuffle All, Now
+     * The home menu is Shuffle All, Songs, Artists, Albums, Playlists, Now
      * Playing, Settings, About - so a name here is the screen the keys
      * actually land on, and the two have to be kept in step. They were not:
      * "songs" was one 'd' short and showed Artists, and every later name was
      * off by the same step. A screenshot that lies about which screen it is
      * costs more than no screenshot.
      *
-     * Shuffle All comes last because it is the one step with an effect that
-     * outlives its own frame: it starts playback, so anything rendered after
-     * it would be rendered over a running track.
+     * Shuffle All comes last in this list even though it is first in the
+     * menu: it is the one step with an effect that outlives its own frame,
+     * because it starts playback, and anything rendered after it would be
+     * rendered over a running track.
      */
     static const struct { const char *name; const char *keys; } WALK[] = {
-        { "menu",           ""                   },
-        { "artists",        "ds"                 },  /* down to Artists, open */
-        { "letters",        "dss"                },  /* ...and into Jump to... */
-        { "artists-jumped", "dssdddds"           },  /* pick a letter */
-        { "albums",         "dds"                },
-        { "album-tracks",   "ddsdddddddddddddds" },
-        { "settings",       "dddddds"            },
-        { "about",          "ddddddds"           },
-        { "now-playing",    "dddds"              },  /* Shuffle All */
+        { "menu",           ""                    },
+        { "artists",        "dds"                 },  /* down to Artists, open */
+        { "letters",        "ddss"                },  /* ...and into Jump to... */
+        { "artists-jumped", "ddssdddds"           },  /* pick a letter */
+        { "albums",         "ddds"                },
+        { "album-tracks",   "dddsdddddddddddddds" },
+        { "settings",       "dddddds"             },
+        { "about",          "ddddddds"            },
+        { "now-playing",    "s"                   },  /* Shuffle All */
     };
 
     for (unsigned i = 0; i < sizeof WALK / sizeof WALK[0]; i++) {

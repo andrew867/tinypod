@@ -18,10 +18,10 @@ under `iPod_Control`. Mount the volume and it finds the music.
 | ![Now Playing](docs/images/now-playing.png) | ![Settings](docs/images/settings.png) | ![About](docs/images/about.png) |
 | Now Playing | Settings | About, and which build this is |
 
-The browsing screens come off a real 496-track library; the last three off the
-three-song test fixture, which is why they look so quiet. Every one of them is
-rendered by `tinypod gui-shots`, which drives the same view and key-handling
-code the device runs — see [Screenshots](#screenshots).
+The list screens come off a real 496-track library; the home menu, Now Playing,
+Settings and About off the three-song test fixture, which is why they look so
+quiet. Every one is rendered by `tinypod gui-shots`, which drives the same view
+and key-handling code the device runs — see [Screenshots](#screenshots).
 
 ## Reading the library
 

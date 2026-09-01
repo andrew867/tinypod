@@ -23,6 +23,18 @@ int tp_sink_write(struct tp_sink *s, const int16_t *pcm, int samples);
 void tp_sink_drain(struct tp_sink *s);
 
 /*
+ * How many times the stream has had to be restarted - each one an underrun,
+ * and on this device a 60 ms silence while the codec settles its rate change.
+ * tinyalsa recovers from these on its own and reports nothing, so without a
+ * count a stream that stutters continuously looks exactly like one that does
+ * not.
+ */
+unsigned long tp_sink_restarts(const struct tp_sink *s);
+
+/* Short description for the Settings screen: "alsa 320 ms". */
+int tp_sink_describe(const struct tp_sink *s, char *out, size_t cap);
+
+/*
  * Stop and restart the stream around a pause. Without this the device simply
  * underruns while nothing is being written, and the next write has to recover
  * from a broken stream instead of resuming a stopped one.

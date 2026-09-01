@@ -8,6 +8,19 @@
 
 #ifdef TINYPOD_HAVE_TINYALSA
 #include <tinyalsa/pcm.h>
+
+/*
+ * tinyalsa 2.0.0 exports pcm_state but forgets to declare it: the PCM_STATE_*
+ * values it returns are all documented in pcm.h, and the function itself is
+ * not. Declaring it here is a matching prototype, so a version that does
+ * declare it will agree rather than conflict.
+ *
+ * It is the only way to see an underrun from out here. tinyalsa recovers from
+ * one inside pcm_writei - it re-prepares and retries - and returns success,
+ * so a stream restarting several times a second is indistinguishable from one
+ * playing cleanly unless you look at the state on the way in.
+ */
+int pcm_state(struct pcm *pcm);
 #endif
 
 /*
@@ -46,6 +59,12 @@ struct tp_sink {
     int fd;              /* OSS */
     FILE *wav;
     unsigned long wav_bytes;
+
+    /* What the device actually gave us, and how badly it is coping. */
+    unsigned int  period_frames;
+    unsigned int  periods;
+    unsigned long restarts;
+    int           started;
 };
 
 static void fail(char *err, size_t errsz, const char *fmt, ...)
@@ -95,33 +114,90 @@ static struct tp_sink *alsa_open(int rate, int channels, char *err, size_t errsz
         device = (unsigned int)strtoul(e, NULL, 10);
 
     /*
-     * 10 ms periods, four of them. Same shape n31-sine proved on the glass:
-     * at 44100 that is an exact 441-frame period, and 40 ms of buffer is
-     * enough to ride out a NAND read without underrunning.
+     * How much audio to keep queued, and why it is no longer 40 ms.
+     *
+     * This was 10 ms periods, four of them - the shape n31-sine proved on the
+     * glass. n31-sine generates a tone into the buffer and does nothing else.
+     * A player decodes a frame and reads the next one off a vfat mount on
+     * NAND, and either of those can take longer than 20 ms on this machine
+     * whenever it feels like it.
+     *
+     * When the buffer runs dry ALSA stops the stream, and tinyalsa quietly
+     * re-prepares and starts it again on the next write - so nothing here
+     * ever saw an error. What it costs is on the other side: this codec takes
+     * a 60 ms rate-change settle inside its play-start, so every underrun is
+     * a fragment of audio followed by 60 ms of silence, over and over. That
+     * is what "codec_play_start" repeating in the log means.
+     *
+     * A ladder rather than one shape, because the driver is still being
+     * brought up and we do not know what it will accept. Biggest first; the
+     * last rung is the old shape, so this cannot open fewer devices than it
+     * used to. TINYPOD_ALSA_PERIOD_MS and TINYPOD_ALSA_PERIODS pin one for
+     * trying things on the device without a rebuild.
      */
-    period = (rate % 100) == 0 ? (unsigned int)rate / 100u : 512u;
+    static const struct { unsigned int ms, count; } SHAPES[] = {
+        { 40, 8 },   /* 320 ms */
+        { 20, 8 },   /* 160 ms */
+        { 20, 4 },   /*  80 ms */
+        { 10, 4 },   /*  40 ms - what this used to be, and what stuttered */
+    };
+    unsigned int want_ms = 0, want_count = 0;
+    unsigned int i, n = sizeof SHAPES / sizeof SHAPES[0];
+    char tried[160] = "";
 
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.channels = (unsigned int)channels;
-    cfg.rate = (unsigned int)rate;
-    cfg.format = PCM_FORMAT_S16_LE;
-    cfg.period_size = period;
-    cfg.period_count = 4;
-    cfg.start_threshold = period * 2;
-    cfg.stop_threshold = period * 4;
-    cfg.silence_threshold = 0;
-    cfg.avail_min = period;
+    if ((e = getenv("TINYPOD_ALSA_PERIOD_MS")) != NULL)
+        want_ms = (unsigned int)strtoul(e, NULL, 10);
+    if ((e = getenv("TINYPOD_ALSA_PERIODS")) != NULL)
+        want_count = (unsigned int)strtoul(e, NULL, 10);
 
-    s->pcm = pcm_open(card, device, PCM_OUT, &cfg);
-    if (!s->pcm || !pcm_is_ready(s->pcm)) {
-        fail(err, errsz, "ALSA card %u device %u: %s", card, device,
-             s->pcm ? pcm_get_error(s->pcm) : "no such device");
-        if (s->pcm)
+    for (i = 0; i < n; i++) {
+        unsigned int ms = want_ms ? want_ms : SHAPES[i].ms;
+        unsigned int count = want_count ? want_count : SHAPES[i].count;
+        size_t used = strlen(tried);
+
+        /* A whole number of frames, or a power of two if the rate will not
+           divide evenly - 44100 gives 882 at 20 ms, 22050 gives 441. */
+        period = ((unsigned int)rate * ms) / 1000u;
+        if (period == 0 || ((unsigned int)rate * ms) % 1000u)
+            period = 1024u;
+
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.channels = (unsigned int)channels;
+        cfg.rate = (unsigned int)rate;
+        cfg.format = PCM_FORMAT_S16_LE;
+        cfg.period_size = period;
+        cfg.period_count = count;
+        /*
+         * Start with the buffer full rather than half full. Half a buffer is
+         * half the time to the first underrun, and the decoder is at its
+         * slowest at the beginning of a track - the file is being opened and
+         * the first frame parsed while the device is already playing.
+         */
+        cfg.start_threshold = period * count;
+        cfg.stop_threshold = period * count;
+        cfg.silence_threshold = 0;
+        cfg.avail_min = period;
+
+        s->pcm = pcm_open(card, device, PCM_OUT, &cfg);
+        if (s->pcm && pcm_is_ready(s->pcm)) {
+            s->period_frames = period;
+            s->periods = count;
+            return s;
+        }
+        snprintf(tried + used, sizeof(tried) - used, "%s%ux%ums",
+                 used ? ", " : "", count, ms);
+        if (s->pcm) {
             pcm_close(s->pcm);
-        free(s);
-        return NULL;
+            s->pcm = NULL;
+        }
+        if (want_ms || want_count)
+            break;                      /* pinned by hand: one attempt only */
     }
-    return s;
+
+    fail(err, errsz, "ALSA card %u device %u would not open (tried %s)",
+         card, device, tried[0] ? tried : "nothing");
+    free(s);
+    return NULL;
 #else
     (void)rate;
     (void)channels;
@@ -342,14 +418,74 @@ int tp_sink_write(struct tp_sink *s, const int16_t *pcm, int samples)
 #ifdef TINYPOD_HAVE_TINYALSA
     if (s->kind == SINK_ALSA) {
         unsigned int frames = (unsigned int)samples / (unsigned int)s->channels;
+        const char *p = (const char *)pcm;
+
         if (!frames)
             return 0;
-        if (pcm_writei(s->pcm, pcm, frames) < 0)
-            return -1;
+
+        /*
+         * Count restarts before writing. tinyalsa recovers from an underrun
+         * by itself - it re-prepares and retries inside pcm_writei - so a
+         * stream that is stopping and starting several times a second looks
+         * from here exactly like one that is playing perfectly. The only
+         * sign is the state on the way in: once we have started, anything
+         * but RUNNING means the last buffer ran dry.
+         */
+        if (s->started) {
+            int st = pcm_state(s->pcm);
+            if (st != PCM_STATE_RUNNING && st != PCM_STATE_DRAINING)
+                s->restarts++;
+        }
+
+        /*
+         * Write until it is all gone. pcm_writei returns the number of frames
+         * taken, which may be fewer than asked for; treating any non-negative
+         * answer as "all of it" dropped the remainder silently.
+         */
+        while (frames > 0) {
+            int got = pcm_writei(s->pcm, p, frames);
+            if (got < 0)
+                return -1;
+            if (got == 0)
+                continue;
+            s->started = 1;
+            p += (size_t)got * (size_t)s->channels * sizeof(int16_t);
+            frames -= (unsigned int)got;
+        }
         return 0;
     }
 #endif
     return -1;
+}
+
+unsigned long tp_sink_restarts(const struct tp_sink *s)
+{
+    return s ? s->restarts : 0;
+}
+
+int tp_sink_describe(const struct tp_sink *s, char *out, size_t cap)
+{
+    if (!out || !cap)
+        return -1;
+    if (!s) {
+        snprintf(out, cap, "none");
+        return 0;
+    }
+    if (s->kind == SINK_WAV) {
+        snprintf(out, cap, "wav capture");
+        return 0;
+    }
+    if (s->kind == SINK_OSS) {
+        snprintf(out, cap, "oss");
+        return 0;
+    }
+    if (s->periods && s->rate > 0)
+        snprintf(out, cap, "alsa %lu ms",
+                 (unsigned long)s->period_frames * s->periods * 1000ul /
+                 (unsigned long)s->rate);
+    else
+        snprintf(out, cap, "alsa");
+    return 0;
 }
 
 void tp_sink_pause(struct tp_sink *s, int paused)
@@ -382,8 +518,32 @@ void tp_sink_drain(struct tp_sink *s)
     if (!s)
         return;
 #ifdef TINYPOD_HAVE_TINYALSA
-    if (s->kind == SINK_ALSA && s->pcm)
+    if (s->kind == SINK_ALSA && s->pcm) {
+        /*
+         * Play out what is queued, rather than throwing it away.
+         *
+         * This called pcm_stop() alone, which drops the buffer - so the last
+         * of every track was cut off, and with the buffer now a third of a
+         * second that would be plainly audible. tinyalsa has no drain, so
+         * push a buffer of silence through instead: the write blocks until
+         * the hardware has taken it, by which time the real audio in front
+         * of it has been played.
+         */
+        if (s->started && s->period_frames) {
+            size_t bytes = (size_t)s->period_frames *
+                           (size_t)s->channels * sizeof(int16_t);
+            int16_t *quiet = calloc(1, bytes);
+
+            if (quiet) {
+                unsigned int i;
+                for (i = 0; i < s->periods; i++)
+                    if (pcm_writei(s->pcm, quiet, s->period_frames) < 0)
+                        break;
+                free(quiet);
+            }
+        }
         pcm_stop(s->pcm);
+    }
 #endif
 #ifdef TINYPOD_HAVE_OSS
     if (s->kind == SINK_OSS && s->fd >= 0)

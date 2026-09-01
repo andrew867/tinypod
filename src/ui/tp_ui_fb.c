@@ -254,11 +254,13 @@ static void draw_term(struct ui_state *ui)
         printf("  no music volume - mount the disk, then restart\n");
     switch (ui->screen) {
     case UI_HOME:
-        printf("  %s Songs\n", ui->sel == 0 ? ">" : " ");
-        printf("  %s Artists\n", ui->sel == 1 ? ">" : " ");
-        printf("  %s Albums\n", ui->sel == 2 ? ">" : " ");
-        printf("  %s Playlists\n", ui->sel == 3 ? ">" : " ");
-        printf("  %s Shuffle Songs\n", ui->sel == 4 ? ">" : " ");
+        /* The same order as the graphical UI's k_menu. Two front ends over
+           one library are only confusing when their menus disagree. */
+        printf("  %s Shuffle All\n", ui->sel == 0 ? ">" : " ");
+        printf("  %s Songs\n", ui->sel == 1 ? ">" : " ");
+        printf("  %s Artists\n", ui->sel == 2 ? ">" : " ");
+        printf("  %s Albums\n", ui->sel == 3 ? ">" : " ");
+        printf("  %s Playlists\n", ui->sel == 4 ? ">" : " ");
         printf("  %s Now Playing\n", ui->sel == 5 ? ">" : " ");
         printf("  %s Settings\n", ui->sel == 6 ? ">" : " ");
         printf("  %s About\n", ui->sel == 7 ? ">" : " ");
@@ -325,10 +327,7 @@ static void draw_term(struct ui_state *ui)
                tp_player_backend_name(ui->app->backend));
         break;
     case UI_ABOUT:
-        printf("TinyPod — free iPod-native player for N31 Linux\n"
-               "build %s\n", tp_build_version());
-        printf(
-               "Read-only. No sync. No database rebuild.\n");
+        printf("TinyPod\nbuild %s\n", tp_build_version());
         break;
     }
     fflush(stdout);
@@ -338,11 +337,7 @@ static void activate(struct ui_state *ui)
 {
     if (ui->screen == UI_HOME) {
         switch (ui->sel) {
-        case 0: ui->screen = UI_SONGS; ui->sel = 0; break;
-        case 1: ui->screen = UI_ARTISTS; ui->sel = 0; break;
-        case 2: ui->screen = UI_ALBUMS; ui->sel = 0; break;
-        case 3: ui->screen = UI_PLAYLISTS; ui->sel = 0; break;
-        case 4:
+        case 0:
             ui->app->cfg.shuffle = 1;
             tp_queue_from_library(&ui->app->queue, &ui->app->lib, 1);
             if (ui->app->queue.count &&
@@ -350,6 +345,10 @@ static void activate(struct ui_state *ui)
                 ui->was_playing = 1;
             ui->screen = UI_NOW;
             break;
+        case 1: ui->screen = UI_SONGS; ui->sel = 0; break;
+        case 2: ui->screen = UI_ARTISTS; ui->sel = 0; break;
+        case 3: ui->screen = UI_ALBUMS; ui->sel = 0; break;
+        case 4: ui->screen = UI_PLAYLISTS; ui->sel = 0; break;
         case 5: ui->screen = UI_NOW; break;
         case 6: ui->screen = UI_SETTINGS; break;
         case 7: ui->screen = UI_ABOUT; break;

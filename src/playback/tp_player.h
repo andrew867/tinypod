@@ -59,6 +59,13 @@ unsigned long tp_player_position_ms(struct tp_player *p);
    position is bounded by elapsed time, so the usual symptom of this (a clock
    racing) no longer shows; this is how it says so instead. */
 int tp_player_not_pacing(struct tp_player *p);
+
+/* What the audio sink turned out to be ("alsa 320 ms"), and how many times it
+   has had to restart. An underrun is invisible from here - tinyalsa recovers
+   by itself - but each one costs this codec a 60 ms settle, so a count is the
+   difference between "it stutters" and a number. */
+int tp_player_sink_desc(struct tp_player *p, char *out, size_t cap);
+unsigned long tp_player_restarts(struct tp_player *p);
 unsigned long tp_player_duration_ms(struct tp_player *p);
 int tp_player_rate(struct tp_player *p);
 int tp_player_channels(struct tp_player *p);

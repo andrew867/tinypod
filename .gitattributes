@@ -14,3 +14,8 @@
 # Screens are compared by eye, not by diff.
 *.png   binary
 *.bmp   binary
+
+# The LVGL config keys the object cache by its own hash. Checked out with
+# CRLF it hashes differently every time a branch switch rewrites it, which
+# throws away 466 compiled objects for a file that has not changed.
+src/ui/lvgl/lv_conf_tp.h text eol=lf

@@ -74,6 +74,12 @@ struct tp_player {
     /* The device took data faster than real time for long enough that it
        cannot be playing it. */
     int not_pacing;
+
+    /* What the sink turned out to be, and how often it had to be restarted.
+       Kept here because the sink itself is opened and closed by the playback
+       thread, and the screens that want to show this outlive it. */
+    char sink_desc[32];
+    unsigned long restarts;
 };
 
 const char *tp_player_backend_name(enum tp_player_backend b)
@@ -169,6 +175,8 @@ static void *play_thread(void *arg)
         goto done;
 
     pthread_mutex_lock(&p->lock);
+    tp_sink_describe(sink, p->sink_desc, sizeof(p->sink_desc));
+    p->restarts = 0;
     p->rate = tp_dec_rate(dec);
     p->channels = tp_dec_channels(dec);
     p->dur_ms = (unsigned long)tp_dec_duration_ms(dec);
@@ -212,6 +220,7 @@ static void *play_thread(void *arg)
 
         pthread_mutex_lock(&p->lock);
         p->played_samples += (unsigned long long)n;
+        p->restarts = tp_sink_restarts(sink);
         pthread_mutex_unlock(&p->lock);
     }
 
@@ -398,6 +407,39 @@ int tp_player_not_pacing(struct tp_player *p)
         return 0;
     pthread_mutex_lock(&p->lock);
     v = p->not_pacing;
+    pthread_mutex_unlock(&p->lock);
+    return v;
+}
+
+/*
+ * How the sink is configured, and how many times it has had to restart.
+ *
+ * Both are worth showing on the device. An underrun is silent from the
+ * application's side - tinyalsa re-prepares and carries on - but on this
+ * codec each one costs a 60 ms settle, so a stream restarting several times a
+ * second is a fragment of music, silence, a fragment of music. Without a
+ * count the only way to know is to read the kernel log.
+ */
+int tp_player_sink_desc(struct tp_player *p, char *out, size_t cap)
+{
+    if (!out || !cap)
+        return -1;
+    out[0] = 0;
+    if (!p)
+        return -1;
+    pthread_mutex_lock(&p->lock);
+    snprintf(out, cap, "%s", p->sink_desc);
+    pthread_mutex_unlock(&p->lock);
+    return 0;
+}
+
+unsigned long tp_player_restarts(struct tp_player *p)
+{
+    unsigned long v;
+    if (!p)
+        return 0;
+    pthread_mutex_lock(&p->lock);
+    v = p->restarts;
     pthread_mutex_unlock(&p->lock);
     return v;
 }
