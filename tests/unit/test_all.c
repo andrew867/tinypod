@@ -4,8 +4,10 @@
 #include "tp_mount.h"
 #include "tp_file_probe.h"
 #include "tp_log.h"
+#include "tp_sink.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -179,6 +181,81 @@ static void test_missing_music(void)
     free(it);
 }
 
+
+/*
+ * The sink's rate conversion.
+ *
+ * tinyalsa hands the hardware exactly what it is given, so a codec that only
+ * clocks 48 kHz simply refuses a 44.1 kHz track - which is why mpg123 and
+ * ffplay, which go through alsa-lib's plughw and resample, played tracks
+ * TinyPod would not. This is the conversion that fixes that, and a host has
+ * no way to provoke it, so it is exercised here instead.
+ */
+static void test_sink_resample(void)
+{
+    enum { IN = 441, CAP = 2048 };
+    int16_t in[IN * 2], out[CAP * 2];
+    int i, got, total;
+
+    /* A full-scale sine, because interpolation that is not clamped shows up
+       at the rails and nowhere else. */
+    for (i = 0; i < IN; i++) {
+        double t = (double)i / 44100.0;
+        int16_t v = (int16_t)(32767.0 * sin(2.0 * 3.14159265358979 * 440.0 * t));
+        in[i * 2] = v;
+        in[i * 2 + 1] = v;
+    }
+
+    /* 44100 -> 48000 on 441 frames is 480, give or take the fraction. */
+    got = tp_sink_convert_test(44100, 48000, 2, 2, in, IN, out, CAP);
+    EXPECT(got >= 478 && got <= 482);
+
+    /* Nothing left the int16 range by wrapping: a sample that should be near
+       full scale must not come back near the opposite rail. */
+    {
+        int wrapped = 0;
+        for (i = 1; i < got; i++) {
+            int32_t d = (int32_t)out[i * 2] - (int32_t)out[(i - 1) * 2];
+            if (d > 40000 || d < -40000)
+                wrapped = 1;
+        }
+        EXPECT(!wrapped);
+    }
+
+    /* Down as well as up. */
+    got = tp_sink_convert_test(48000, 44100, 2, 2, in, IN, out, CAP);
+    EXPECT(got >= 403 && got <= 407);
+
+    /* Mono in, stereo out, with both channels the same. */
+    {
+        int16_t mono[64];
+        for (i = 0; i < 64; i++) mono[i] = (int16_t)(i * 100);
+        got = tp_sink_convert_test(44100, 44100, 1, 2, mono, 64, out, CAP);
+        EXPECT(got >= 62 && got <= 66);
+        for (i = 0; i < got; i++)
+            EXPECT(out[i * 2] == out[i * 2 + 1]);
+    }
+
+    /*
+     * Block boundaries. The decoder hands over arbitrary block sizes, and a
+     * resampler that restarts each time clicks at every seam - so the
+     * fractional position and the previous frame carry across calls. Four
+     * quarter-blocks must produce what one whole block does, not four
+     * independent runs of it.
+     */
+    total = 0;
+    for (i = 0; i < 4; i++) {
+        got = tp_sink_convert_test(44100, 48000, 2, 2,
+                                   in + i * (IN / 4) * 2, IN / 4,
+                                   out, CAP);
+        EXPECT(got > 0);
+        total += got;
+    }
+    /* Four independent runs would each round the same way and drift; allow a
+       frame per call for the fraction and no more. */
+    EXPECT(total >= 476 && total <= 484);
+}
+
 int main(void)
 {
     tp_log_set_level(TP_LOG_ERROR);
@@ -192,6 +269,7 @@ int main(void)
     test_volume_detect_no_mount();
     test_volume_ipod_control();
     test_missing_music();
+    test_sink_resample();
     if (g_fail) {
         fprintf(stderr, "%d test(s) failed\n", g_fail);
         return 1;

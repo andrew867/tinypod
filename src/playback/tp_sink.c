@@ -65,6 +65,23 @@ struct tp_sink {
     unsigned int  periods;
     unsigned long restarts;
     int           started;
+
+    /*
+     * What the caller feeds, when that is not what the device takes.
+     *
+     * tinyalsa talks to hw:0,0 and converts nothing. alsa-lib's "default"
+     * is plughw, which resamples and remixes in userspace - which is why
+     * mpg123 and ffplay play a 44.1 kHz track on a device that only accepts
+     * 48 kHz, and we did not. Rather than refuse the track, open at a rate
+     * the device will take and convert on the way in.
+     */
+    int      src_rate;
+    int      src_channels;
+    int16_t  last[2];        /* previous input frame, for interpolation */
+    int      have_last;
+    uint32_t pos_q16;        /* where we are between last and the next frame */
+    int16_t *conv;
+    size_t   conv_frames;    /* capacity, in device frames */
 };
 
 static void fail(char *err, size_t errsz, const char *fmt, ...)
@@ -106,6 +123,8 @@ static struct tp_sink *alsa_open(int rate, int channels, char *err, size_t errsz
     s->kind = SINK_ALSA;
     s->rate = rate;
     s->channels = channels;
+    s->src_rate = rate;
+    s->src_channels = channels;
     s->fd = -1;
 
     if ((e = getenv("TINYPOD_ALSA_CARD")) != NULL)
@@ -144,6 +163,50 @@ static struct tp_sink *alsa_open(int rate, int channels, char *err, size_t errsz
     unsigned int want_ms = 0, want_count = 0;
     unsigned int i, n = sizeof SHAPES / sizeof SHAPES[0];
     char tried[160] = "";
+    char cando[128] = "";
+
+    /*
+     * Ask the device what it takes before asking it for something else.
+     *
+     * tinyalsa opens hw:0,0 and converts nothing, so a rate the codec does
+     * not do is simply a failed open - and the message was "would not open",
+     * which is true and useless. alsa-lib's "default" goes through plughw and
+     * converts, which is the whole reason mpg123 and ffplay play tracks we
+     * refuse. So: find the rate range, move into it if we have to, and say
+     * what the device offered when we still cannot.
+     */
+    {
+        struct pcm_params *pp = pcm_params_get(card, device, PCM_OUT);
+
+        if (pp) {
+            unsigned int rmin = pcm_params_get_min(pp, PCM_PARAM_RATE);
+            unsigned int rmax = pcm_params_get_max(pp, PCM_PARAM_RATE);
+            unsigned int cmin = pcm_params_get_min(pp, PCM_PARAM_CHANNELS);
+            unsigned int cmax = pcm_params_get_max(pp, PCM_PARAM_CHANNELS);
+
+            snprintf(cando, sizeof cando,
+                     "device does %u-%u Hz, %u-%u channels",
+                     rmin, rmax, cmin, cmax);
+
+            if (rmin && rmax && ((unsigned)rate < rmin || (unsigned)rate > rmax)) {
+                /* 48000 first: it is what this codec is usually clocked at,
+                   and resampling 44100 to it is the common case. */
+                unsigned int pick = 48000;
+                if (pick < rmin || pick > rmax)
+                    pick = (unsigned)rate < rmin ? rmin : rmax;
+                s->rate = (int)pick;
+            }
+            if (cmin && (unsigned)channels < cmin)
+                s->channels = (int)cmin;
+            if (cmax && (unsigned)s->channels > cmax)
+                s->channels = (int)cmax;
+
+            pcm_params_free(pp);
+        }
+    }
+
+    rate = s->rate;
+    channels = s->channels;
 
     if ((e = getenv("TINYPOD_ALSA_PERIOD_MS")) != NULL)
         want_ms = (unsigned int)strtoul(e, NULL, 10);
@@ -194,8 +257,10 @@ static struct tp_sink *alsa_open(int rate, int channels, char *err, size_t errsz
             break;                      /* pinned by hand: one attempt only */
     }
 
-    fail(err, errsz, "ALSA card %u device %u would not open (tried %s)",
-         card, device, tried[0] ? tried : "nothing");
+    fail(err, errsz, "ALSA card %u device %u would not open at %d Hz %d ch.\n%s\ntried %s",
+         card, device, rate, channels,
+         cando[0] ? cando : "device did not say what it supports",
+         tried[0] ? tried : "nothing");
     free(s);
     return NULL;
 #else
@@ -383,6 +448,113 @@ struct tp_sink *tp_sink_open_wav(const char *path, int rate, int channels,
     return s;
 }
 
+/* ---------------------------------------------------- rate and channels --- */
+/*
+ * Linear interpolation, and no apology for it.
+ *
+ * This exists so a track whose rate the codec will not take plays at all,
+ * which it did not before: tinyalsa converts nothing, so 44.1 kHz into a
+ * 48 kHz-only device was a failed open and an error on screen. Linear
+ * resampling has audible imaging above about 15 kHz on a 44.1 -> 48 ratio.
+ * It is still the right trade against silence, and against carrying a
+ * polyphase filter and its tables in a binary that lives in 55 MiB of RAM.
+ *
+ * The wide build links swresample already and could do better; that is worth
+ * doing once there is a device to hear the difference on.
+ *
+ * State carries across calls - the last input frame and the fractional
+ * position - because the decoder hands us arbitrary block sizes and a
+ * resampler that restarts every block clicks at every boundary.
+ */
+static int convert(struct tp_sink *s, const int16_t *in, int in_frames)
+{
+    uint32_t step;
+    size_t need;
+    int out = 0;
+    int i;
+
+    if (in_frames <= 0)
+        return 0;
+
+    step = (uint32_t)(((uint64_t)s->src_rate << 16) / (uint32_t)s->rate);
+    if (!step)
+        step = 1;
+
+    /* Worst case out frames, plus a frame of slack for the fraction. */
+    need = (size_t)((uint64_t)in_frames * (uint32_t)s->rate /
+                    (uint32_t)s->src_rate) + 2;
+    if (need > s->conv_frames) {
+        int16_t *nb = realloc(s->conv, need * (size_t)s->channels *
+                                       sizeof(int16_t));
+        if (!nb)
+            return -1;
+        s->conv = nb;
+        s->conv_frames = need;
+    }
+
+    if (!s->have_last) {
+        s->last[0] = in[0];
+        s->last[1] = s->src_channels > 1 ? in[1] : in[0];
+        s->have_last = 1;
+    }
+
+    for (i = 0; i < in_frames; i++) {
+        int16_t cur0 = in[(size_t)i * s->src_channels];
+        int16_t cur1 = s->src_channels > 1
+                           ? in[(size_t)i * s->src_channels + 1] : cur0;
+
+        while (s->pos_q16 < 65536u && (size_t)out < s->conv_frames) {
+            uint32_t f = s->pos_q16;
+            int32_t l = s->last[0] + (((int32_t)cur0 - s->last[0]) * (int32_t)f >> 16);
+            int32_t r = s->last[1] + (((int32_t)cur1 - s->last[1]) * (int32_t)f >> 16);
+
+            s->conv[(size_t)out * s->channels] = (int16_t)l;
+            if (s->channels > 1)
+                s->conv[(size_t)out * s->channels + 1] = (int16_t)r;
+            out++;
+            s->pos_q16 += step;
+        }
+        s->pos_q16 -= 65536u;
+        s->last[0] = cur0;
+        s->last[1] = cur1;
+    }
+    return out;
+}
+
+/*
+ * The same code the sink runs, reachable from a test.
+ *
+ * This conversion only happens on a device whose codec refuses the track's
+ * rate, which is not something a host build can arrange - so without a hook
+ * the resampler would ship having never been executed. It builds its own
+ * sink rather than taking a second copy of the arithmetic.
+ */
+int tp_sink_convert_test(int src_rate, int dst_rate, int src_ch, int dst_ch,
+                         const int16_t *in, int in_frames,
+                         int16_t *out, int out_cap_frames)
+{
+    struct tp_sink s;
+    int got;
+
+    if (!in || !out || src_rate <= 0 || dst_rate <= 0)
+        return -1;
+
+    memset(&s, 0, sizeof s);
+    s.kind = SINK_ALSA;
+    s.rate = dst_rate;
+    s.channels = dst_ch;
+    s.src_rate = src_rate;
+    s.src_channels = src_ch;
+
+    got = convert(&s, in, in_frames);
+    if (got > out_cap_frames)
+        got = out_cap_frames;
+    if (got > 0)
+        memcpy(out, s.conv, (size_t)got * (size_t)dst_ch * sizeof(int16_t));
+    free(s.conv);
+    return got;
+}
+
 /* --------------------------------------------------------------- write --- */
 
 int tp_sink_write(struct tp_sink *s, const int16_t *pcm, int samples)
@@ -417,8 +589,21 @@ int tp_sink_write(struct tp_sink *s, const int16_t *pcm, int samples)
 
 #ifdef TINYPOD_HAVE_TINYALSA
     if (s->kind == SINK_ALSA) {
-        unsigned int frames = (unsigned int)samples / (unsigned int)s->channels;
-        const char *p = (const char *)pcm;
+        unsigned int frames;
+        const char *p;
+
+        if (s->src_rate != s->rate || s->src_channels != s->channels) {
+            int got = convert(s, pcm, samples / s->src_channels);
+            if (got < 0)
+                return -1;
+            if (got == 0)
+                return 0;
+            pcm = s->conv;
+            samples = got * s->channels;
+        }
+
+        frames = (unsigned int)samples / (unsigned int)s->channels;
+        p = (const char *)pcm;
 
         if (!frames)
             return 0;
@@ -479,12 +664,16 @@ int tp_sink_describe(const struct tp_sink *s, char *out, size_t cap)
         snprintf(out, cap, "oss");
         return 0;
     }
-    if (s->periods && s->rate > 0)
-        snprintf(out, cap, "alsa %lu ms",
-                 (unsigned long)s->period_frames * s->periods * 1000ul /
-                 (unsigned long)s->rate);
-    else
+    if (s->periods && s->rate > 0) {
+        unsigned long ms = (unsigned long)s->period_frames * s->periods *
+                           1000ul / (unsigned long)s->rate;
+        if (s->src_rate != s->rate)
+            snprintf(out, cap, "alsa %lu ms %d>%d", ms, s->src_rate, s->rate);
+        else
+            snprintf(out, cap, "alsa %lu ms", ms);
+    } else {
         snprintf(out, cap, "alsa");
+    }
     return 0;
 }
 
@@ -566,6 +755,7 @@ void tp_sink_close(struct tp_sink *s)
 #ifdef TINYPOD_HAVE_TINYALSA
     if (s->kind == SINK_ALSA && s->pcm)
         pcm_close(s->pcm);
+    free(s->conv);
 #endif
 #ifdef TINYPOD_HAVE_OSS
     if (s->kind == SINK_OSS && s->fd >= 0)

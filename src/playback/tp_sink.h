@@ -35,6 +35,18 @@ unsigned long tp_sink_restarts(const struct tp_sink *s);
 int tp_sink_describe(const struct tp_sink *s, char *out, size_t cap);
 
 /*
+ * The sink's rate/channel conversion, exposed for tests.
+ *
+ * It only runs on a device whose codec refuses the track's rate - tinyalsa
+ * converts nothing, unlike alsa-lib's plughw - which is not a situation a
+ * host build can arrange, so without this the resampler would ship having
+ * never run. Returns frames written to out, or -1.
+ */
+int tp_sink_convert_test(int src_rate, int dst_rate, int src_ch, int dst_ch,
+                         const int16_t *in, int in_frames,
+                         int16_t *out, int out_cap_frames);
+
+/*
  * Stop and restart the stream around a pause. Without this the device simply
  * underruns while nothing is being written, and the next write has to recover
  * from a broken stream instead of resuming a stopped one.
