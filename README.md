@@ -104,30 +104,34 @@ your own copy.
 
 ### The device
 
-`tools/linux-n31/build-n31-tinypod.sh` in the ipod tree fetches the musl
-toolchain and tinyalsa. The two binaries that ship are then:
+One script, in the ipod tree:
 
 ```sh
-# LVGL for ARM. The archive only — the binary is linked by the main Makefile,
-# so there is one copy of the player rather than two that can drift.
-make -C src/ui/lvgl -f Makefile.lvgl n31 LVGL=/path/to/lvgl
-
-# The lean build, for the initramfs.
-make TARGET=n31 UI_LVGL=1 LVGL=/path/to/lvgl \
-     CROSS=<toolchain>/bin/arm-linux-musleabi- \
-     TINYALSA_DIR=/path/to/tinyalsa-2.0.0
-
-# The wide build, for the volume. Needs the ARM FFmpeg libraries first.
-CROSS=<toolchain>/bin/arm-linux-musleabi- ./tools/fetch-ffmpeg.sh
-make TARGET=n31 UI_LVGL=1 LVGL=/path/to/lvgl FFMPEG=1 \
-     CROSS=<toolchain>/bin/arm-linux-musleabi- \
-     TINYALSA_DIR=/path/to/tinyalsa-2.0.0
+tools/linux-n31/build-n31-tinypod.sh
 ```
 
-Each stages itself into `artifacts/linux-n31` under the name it is installed
-as — `tinypod` and `tinypod-full` — where `mk-initramfs.sh` and
-`install-n31os-disk.ps1` pick them up. See
+It fetches the musl toolchain, tinyalsa, the Helix sources and — once — an ARM
+FFmpeg, builds the LVGL archive and then both binaries, and stages them into
+`artifacts/linux-n31` as `tinypod` and `tinypod-full`, where `mk-initramfs.sh`
+and `install-n31os-disk.ps1` pick them up. See
 [Two device builds](#two-device-builds) for why there are two.
+
+It then checks what it produced, because each of these has been wrong at some
+point in a way that only showed up on the device, where nothing prints: no
+dynamic `NEEDED` entries, `Tag_FP_arch` present so the FPU is really being
+used, and the graphical UI actually linked in.
+
+By hand, the same thing is:
+
+```sh
+make -C src/ui/lvgl -f Makefile.lvgl n31 LVGL=/path/to/lvgl   # the archive only
+make TARGET=n31 UI_LVGL=1 LVGL=/path/to/lvgl \
+     CROSS=<toolchain>/bin/arm-linux-musleabi- \
+     TINYALSA_DIR=/path/to/tinyalsa-2.0.0 [FFMPEG=1]
+```
+
+`TINYPOD_UI=0` builds without the graphical UI, and `TINYPOD_FFMPEG=0` skips
+the wide build.
 
 ### Which build is this
 
@@ -234,13 +238,13 @@ linked, and the fallback branch does not exist.
 
 ### Two device builds
 
-| binary | size | lives in |
+| binary | size, stripped | lives in |
 |---|---:|---|
-| `tinypod` | 1.97 MB | the initramfs |
-| `tinypod-full` | 4.44 MB | the volume, installed as `tinypod` |
+| `tinypod` | 1.66 MB | the initramfs |
+| `tinypod-full` | 3.86 MB | the volume, installed as `tinypod` |
 
 The initramfs is a tmpfs: everything in it holds system RAM for the whole
-session, and this machine has 55 MiB of it. Spending 2.5 MB of that permanently
+session, and this machine has 55 MiB of it. Spending 2.2 MB of that permanently
 on decoders most tracks never reach is a poor trade. The disk pages on demand,
 so the wide build there costs what it uses rather than what it weighs.
 

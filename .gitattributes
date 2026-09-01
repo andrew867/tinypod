@@ -1,0 +1,16 @@
+# Shell scripts keep LF, whatever the platform.
+#
+# core.autocrlf is on in Git for Windows, so a checkout here gives every text
+# file CRLF - and these scripts are not run by Windows. They are run by WSL
+# bash during the build and by the device's shell after it, and both take a
+# trailing CR as part of the word: `set -euo pipefail\r` comes back as
+# "pipefail: invalid option name", and a `#!/usr/bin/env bash\r` shebang looks
+# for an interpreter that does not exist. The build script that calls them
+# then stops with an error about an option name, ten lines from anything to
+# do with line endings.
+*.sh    text eol=lf
+*.py    text eol=lf
+
+# Screens are compared by eye, not by diff.
+*.png   binary
+*.bmp   binary

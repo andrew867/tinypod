@@ -93,7 +93,7 @@ check:
 	    $(HERE)tp_lv_ui.c $(HERE)tp_lv_input.c $(HERE)tp_lv_screens.c
 	@echo 'the graphical UI type-checks on the host'
 
-.PHONY: shots n31 push clean
+.PHONY: shots n31 host push clean
 shots: $(HOST_BUILD)/preview
 	@mkdir -p $(HERE)shots
 	@cd $(HERE) && ./build-preview/preview shots
@@ -114,6 +114,22 @@ $(HOST_BUILD)/preview: $(HERE)preview.c $(HERE)tp_lv_screens.c $(HOST_LVLIB)
 	@mkdir -p $(HOST_BUILD)
 	$(HOST_CC) $(HOST_CFLAGS) $(LV_CFLAGS) -o $@ \
 	    $(HERE)preview.c $(HERE)tp_lv_screens.c $(HOST_LVLIB) -lm -lpthread
+
+# The archive where the main Makefile links it from.
+#
+# It builds in the cache, on the native filesystem, because that is the
+# difference between fourteen seconds and four minutes. But the main Makefile
+# links src/ui/lvgl/build-$(TARGET)/liblvgl.a, and nothing produced that: the
+# copy sitting there had been placed by hand, and had been three days older
+# than the cache for three days. A rebuilt archive that does not reach the
+# linker is indistinguishable from a UI change that did not take.
+$(HERE)build-host/liblvgl.a: $(HOST_LVLIB)
+	@mkdir -p $(dir $@)
+	@cp -f $< $@
+	@echo "LVGL for the host ready: $@"
+
+host: $(HERE)build-host/liblvgl.a
+	@echo "now: make UI_LVGL=1 LVGL=$(LVGL)"
 
 # ---- the device build ------------------------------------------------------
 #
@@ -143,12 +159,16 @@ $(ARM_LVLIB): $(ARM_LV_OBJS)
 	@echo "AR $@"
 	@$(ARM_AR) rcs $@ $^
 
+$(ARM_BUILD)/liblvgl.a: $(ARM_LVLIB)
+	@mkdir -p $(dir $@)
+	@cp -f $< $@
+	@echo "LVGL for ARM ready: $@"
+
 # The archive only. The binary is linked by the main Makefile with UI_LVGL=1,
 # so there is one copy of the player and the library reader rather than two
 # builds that can drift apart.
-n31: $(ARM_LVLIB)
-	@echo "LVGL for ARM ready: $(ARM_LVLIB)"
+n31: $(ARM_BUILD)/liblvgl.a
 	@echo "now: make TARGET=n31 UI_LVGL=1 LVGL=$(LVGL) TINYALSA_DIR=..."
 
 clean:
-	rm -rf $(HOST_BUILD) $(ARM_BUILD) $(HERE)shots
+	rm -rf $(HOST_BUILD) $(ARM_BUILD) $(HERE)build-host $(HERE)shots
