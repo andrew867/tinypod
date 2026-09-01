@@ -478,17 +478,27 @@ void tp_lv_show_now(const struct tp_lv_now *n)
         return;
     }
 
+    /*
+     * The word as well as the symbol.
+     *
+     * A triangle in the middle of the screen is read as a button - press this
+     * to play - and the hint under it says "PLAY pause", which agrees with
+     * that reading. So a playing track showed a play triangle and looked
+     * paused, and the way to check was to press the button and find out. The
+     * symbol alone cannot say whether it is describing the state or offering
+     * the action; a word can.
+     */
     switch (n->state) {
     case 1:
-        lv_label_set_text(s_now_state, LV_SYMBOL_PLAY);
+        lv_label_set_text(s_now_state, LV_SYMBOL_PLAY "  Playing");
         lv_obj_set_style_text_color(s_now_state, lv_color_hex(C_ACCENT), 0);
         break;
     case 2:
-        lv_label_set_text(s_now_state, LV_SYMBOL_PAUSE);
+        lv_label_set_text(s_now_state, LV_SYMBOL_PAUSE "  Paused");
         lv_obj_set_style_text_color(s_now_state, lv_color_hex(C_TEXT_DIM), 0);
         break;
     default:
-        lv_label_set_text(s_now_state, LV_SYMBOL_STOP);
+        lv_label_set_text(s_now_state, LV_SYMBOL_STOP "  Stopped");
         lv_obj_set_style_text_color(s_now_state, lv_color_hex(C_TEXT_MUTE), 0);
         break;
     }
