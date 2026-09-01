@@ -1033,15 +1033,31 @@ int tp_lv_ui_shots(struct tp_app *app, const char *dir)
         return 1;
     }
 
-    /* A walk through the parts worth looking at, by pressing the buttons a
-       person would press. */
+    /*
+     * A walk through the parts worth looking at, by pressing the buttons a
+     * person would press.
+     *
+     * The home menu is Songs, Artists, Albums, Playlists, Shuffle All, Now
+     * Playing, Settings, About - so a name here is the screen the keys
+     * actually land on, and the two have to be kept in step. They were not:
+     * "songs" was one 'd' short and showed Artists, and every later name was
+     * off by the same step. A screenshot that lies about which screen it is
+     * costs more than no screenshot.
+     *
+     * Shuffle All comes last because it is the one step with an effect that
+     * outlives its own frame: it starts playback, so anything rendered after
+     * it would be rendered over a running track.
+     */
     static const struct { const char *name; const char *keys; } WALK[] = {
-        { "10-real-menu",         ""        },
-        { "11-real-songs",        "ds"      },   /* down to Songs, select */
-        { "12-real-jump",         "dss"     },   /* ...and into Jump to... */
-        { "13-real-jumped",       "dssdddds" },  /* pick a letter */
-        { "14-real-artists",      "dds"     },
-        { "15-real-artist-albums", "ddsdddddddddddddds" },
+        { "menu",           ""                   },
+        { "artists",        "ds"                 },  /* down to Artists, open */
+        { "letters",        "dss"                },  /* ...and into Jump to... */
+        { "artists-jumped", "dssdddds"           },  /* pick a letter */
+        { "albums",         "dds"                },
+        { "album-tracks",   "ddsdddddddddddddds" },
+        { "settings",       "dddddds"            },
+        { "about",          "ddddddds"           },
+        { "now-playing",    "dddds"              },  /* Shuffle All */
     };
 
     for (unsigned i = 0; i < sizeof WALK / sizeof WALK[0]; i++) {

@@ -295,8 +295,19 @@ void tp_lv_screens_init(void)
     build_list();
     build_now();
 
-    s_msg = panel(s_screen, 0, LIST_TOP, TP_LV_W, 200, C_BG);
-    s_msg_body = centred(s_msg, "", F_CAPTION, C_TEXT_DIM, 60, 120);
+    /*
+     * As tall as there is room for, rather than the 200x120 this used to be.
+     * LVGL clips a label to its parent, and About is the longest message
+     * here: at this width it runs to nine lines, the box held eight, and the
+     * line that fell off the end was the build stamp - the one thing that
+     * screen exists to tell you. Nothing said so; it simply was not drawn,
+     * which is the worst way for a version number to go missing.
+     *
+     * The text still starts where it did, so every shorter message looks
+     * exactly as it did before.
+     */
+    s_msg = panel(s_screen, 0, LIST_TOP, TP_LV_W, FOOTER_Y - LIST_TOP - 12, C_BG);
+    s_msg_body = centred(s_msg, "", F_CAPTION, C_TEXT_DIM, 60, 240);
 
     /* Two lines' worth. The longest hint - Now Playing, which has to name
        three different actions - does not fit on one at this width, and

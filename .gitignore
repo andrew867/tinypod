@@ -31,3 +31,6 @@ third_party/ffmpeg-*/
 third_party/ffmpeg-build/
 third_party/ffmpeg-*.tar.xz
 testdata/formats/
+
+# Screens are committed as PNG; the renderer writes BMP first.
+docs/images/*.bmp
