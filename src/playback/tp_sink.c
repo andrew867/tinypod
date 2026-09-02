@@ -200,18 +200,44 @@ static struct tp_sink *alsa_open(int rate, int channels, char *err, size_t errsz
     }
 
     /*
-     * The rates to try, in order. The track's own comes first, because that
-     * is the one needing no conversion; then the families this hardware
-     * plausibly has, 48 kHz first since a 12 MHz master clock divides into it
-     * and never into 44.1.
+     * The rates to try, in order.
      *
-     * The open is the authority. A rate that is not in the hardware's set
-     * fails here and costs nothing, which is what makes gaps in that set a
-     * non-problem - no enumeration, no interval arithmetic, no guessing.
+     * The one the hardware actually clocks comes first, and that is not the
+     * same question as which ones it accepts. Measured on this device, asked
+     * for a 44.1 kHz track:
+     *
+     *     rate: 44100        accepted in hw_params
+     *     state: XRUN
+     *     hw_ptr      : 0    and never advanced a frame
+     *     appl_ptr    : 1024
+     *
+     * The driver does not constrain the rate even though the codec runs only
+     * at 48 kHz, so a successful open proves nothing about whether anything
+     * will come out. 48000 is what a 12 MHz master clock divides into, and
+     * soxr makes the conversion cost nothing worth hearing.
+     *
+     * The track's own rate is still tried, second, so hardware that does
+     * clock it is not resampled for no reason. TINYPOD_ALSA_RATE=track puts
+     * it back in front for a driver that reports honestly, and a number
+     * pins one rate outright.
      */
-    static const int RATES[] = { 0, 48000, 44100, 32000, 96000, 88200,
+    static const int RATES[] = { 48000, 0, 44100, 32000, 96000, 88200,
                                  24000, 22050, 16000, 8000 };
+    static const int RATES_TRACK_FIRST[] = { 0, 44100, 48000, 32000, 96000,
+                                             88200, 24000, 22050, 16000, 8000 };
+    const int *rates = RATES;
     unsigned int r, nr = sizeof RATES / sizeof RATES[0];
+    int pinned = 0;
+
+    if ((e = getenv("TINYPOD_ALSA_RATE")) != NULL && *e) {
+        if (!strcmp(e, "track")) {
+            rates = RATES_TRACK_FIRST;
+        } else {
+            pinned = (int)strtol(e, NULL, 10);
+            if (pinned > 0)
+                nr = 1;
+        }
+    }
 
     /*
      * Channels the same way. A device that only does stereo refuses a mono
@@ -222,10 +248,17 @@ static struct tp_sink *alsa_open(int rate, int channels, char *err, size_t errsz
     unsigned int c;
 
     for (r = 0; r < nr; r++) {
-        int want = RATES[r] ? RATES[r] : rate;
+        int want;
 
-        if (RATES[r] && RATES[r] == rate)
-            continue;                    /* already tried as the track rate */
+        if (pinned > 0) {
+            want = pinned;
+        } else {
+            want = rates[r] ? rates[r] : rate;
+            /* The track rate appears once, wherever the zero sits; skip a
+               later entry that names the same number. */
+            if (rates[r] && rates[r] == rate)
+                continue;
+        }
         if (want <= 0)
             continue;
 

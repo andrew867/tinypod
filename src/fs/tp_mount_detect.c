@@ -77,6 +77,8 @@ static int try_set_from_ipod_control(struct tp_volume *out, const char *ipod)
     return out->ipod_control_root ? 0 : -1;
 }
 
+static int looks_like_ipod_control(const char *path);
+
 static int try_set_from_mount(struct tp_volume *out, const char *mount)
 {
     char *ipod;
@@ -94,27 +96,60 @@ static int try_set_from_mount(struct tp_volume *out, const char *mount)
         return out->mount_root ? 0 : -1;
     }
     free(ipod);
-    /* Maybe mount itself is iPod_Control */
-    if (dir_ok(tp_path_join2(mount, "iTunes")) || dir_ok(tp_path_join2(mount, "Music"))) {
-        /* leak-safe: check by constructing once */
-        char *it = tp_path_join2(mount, "iTunes");
-        char *mu = tp_path_join2(mount, "Music");
-        int ok = (it && dir_ok(it)) || (mu && dir_ok(mu));
-        free(it);
-        free(mu);
-        if (ok)
-            return try_set_from_ipod_control(out, mount);
-    }
+
+    /* No iPod_Control under it - so perhaps it is one. Same test as
+       everywhere else, which also stops this leaking the two paths it used to
+       build twice and free once. */
+    if (looks_like_ipod_control(mount))
+        return try_set_from_ipod_control(out, mount);
     return -1;
 }
 
+/* Case-insensitive name compare. vfat is case-preserving and
+   case-insensitive, so the directory can come back spelled any way at all. */
+static int name_is(const char *a, const char *b)
+{
+    size_t i;
+
+    for (i = 0; a[i] && b[i]; i++) {
+        char x = a[i], y = b[i];
+        if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
+        if (x != y) return 0;
+    }
+    return a[i] == 0 && b[i] == 0;
+}
+
+/*
+ * Is this directory itself an iPod_Control?
+ *
+ * It used to be enough to hold an iTunes folder OR a Music folder. "Music" is
+ * what anyone would call a folder of music, so a volume with one at its root
+ * was taken for an iPod_Control - and the real iPod_Control next to it was
+ * never looked at. That is 496 tracks going missing because somebody copied
+ * an album onto the disk.
+ *
+ * Named iPod_Control is conclusive. Otherwise it takes both: every real
+ * iPod_Control has an iTunes directory beside its Music one, and a folder of
+ * albums has neither the name nor the pair.
+ */
 static int looks_like_ipod_control(const char *path)
 {
+    const char *base;
     char *it, *mu;
     int ok;
+
+    if (!path)
+        return 0;
+
+    base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    if (name_is(base, "iPod_Control"))
+        return 1;
+
     it = tp_path_join2(path, "iTunes");
     mu = tp_path_join2(path, "Music");
-    ok = (it && dir_ok(it)) || (mu && dir_ok(mu));
+    ok = it && mu && dir_ok(it) && dir_ok(mu);
     free(it);
     free(mu);
     return ok;
@@ -171,22 +206,25 @@ int tp_mount_detect(const char *cli_mount, struct tp_volume *out)
      * than where you were told is worth knowing about.
      */
     if (cli_mount && cli_mount[0]) {
-        if (looks_like_ipod_control(cli_mount)) {
-            if (try_set_from_ipod_control(out, cli_mount) == 0)
-                return 0;
-        }
+        /*
+         * <path>/iPod_Control first, and only then whether <path> might be
+         * one itself. Finding the real thing beats a heuristic, and the
+         * heuristic used to run first purely by accident of ordering.
+         */
         if (try_set_from_mount(out, cli_mount) == 0)
+            return 0;
+        if (looks_like_ipod_control(cli_mount) &&
+            try_set_from_ipod_control(out, cli_mount) == 0)
             return 0;
         tp_info("no library at %s - looking elsewhere", cli_mount);
     }
 
     env = getenv("TINYPOD_MOUNT");
     if (env && env[0]) {
-        if (looks_like_ipod_control(env)) {
-            if (try_set_from_ipod_control(out, env) == 0)
-                return 0;
-        }
         if (try_set_from_mount(out, env) == 0)
+            return 0;
+        if (looks_like_ipod_control(env) &&
+            try_set_from_ipod_control(out, env) == 0)
             return 0;
     }
 

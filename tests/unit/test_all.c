@@ -510,6 +510,95 @@ static void test_browse_paths(void)
     EXPECT(tp_browse_parent(out, sizeof out, "/") == -1);
 }
 
+
+/*
+ * A folder of music at the volume root must not shadow the iPod_Control.
+ *
+ * This is what a real disk looks like once somebody copies an album onto it,
+ * and it took the library out completely: "Music" alone was enough for the
+ * root to be mistaken for an iPod_Control, so detection looked for
+ * <root>/iTunes, did not find it, saw <root>/Music, decided raw scan, walked
+ * the wrong tree and reported that the library could not be loaded. The real
+ * iPod_Control was one level down the whole time, and nothing said so,
+ * because the fallback warning only fires for formats other than raw scan.
+ */
+static void test_mount_music_folder_beside_ipod_control(void)
+{
+    char root[] = "/tmp/tp_vol_XXXXXX";
+    char *ic, *it, *mu, *own;
+    struct tp_volume v;
+
+    if (!mkdtemp(root)) { EXPECT(0); return; }
+
+    /* The real thing. */
+    ic = tp_path_join2(root, "iPod_Control");
+    mkdir(ic, 0755);
+    it = tp_path_join2(ic, "iTunes");
+    mkdir(it, 0755);
+    mu = tp_path_join2(ic, "Music");
+    mkdir(mu, 0755);
+
+    /* And somebody's own music, at the root, next to it. */
+    own = tp_path_join2(root, "Music");
+    mkdir(own, 0755);
+
+    EXPECT(tp_mount_detect(root, &v) == 0);
+    if (v.ipod_control_root)
+        EXPECT(strcmp(v.ipod_control_root, ic) == 0);
+    if (v.mount_root)
+        EXPECT(strcmp(v.mount_root, root) == 0);
+    tp_volume_free(&v);
+
+    free(ic); free(it); free(mu); free(own);
+}
+
+/*
+ * Handed the iPod_Control itself, it still has to work - that is a documented
+ * way to call it, and the stricter test must not have broken it.
+ */
+static void test_mount_named_ipod_control(void)
+{
+    char root[] = "/tmp/tp_vol2_XXXXXX";
+    char *ic, *it, *mu;
+    struct tp_volume v;
+
+    if (!mkdtemp(root)) { EXPECT(0); return; }
+
+    ic = tp_path_join2(root, "iPod_Control");
+    mkdir(ic, 0755);
+    it = tp_path_join2(ic, "iTunes");
+    mkdir(it, 0755);
+    mu = tp_path_join2(ic, "Music");
+    mkdir(mu, 0755);
+
+    EXPECT(tp_mount_detect(ic, &v) == 0);
+    if (v.ipod_control_root)
+        EXPECT(strcmp(v.ipod_control_root, ic) == 0);
+    tp_volume_free(&v);
+
+    free(ic); free(it); free(mu);
+}
+
+/*
+ * And a plain folder of music, with no iPod_Control anywhere, is not one.
+ * Before this it would have been accepted and then found to contain nothing.
+ */
+static void test_mount_plain_music_folder_is_not_a_volume(void)
+{
+    char root[] = "/tmp/tp_vol3_XXXXXX";
+    char *own;
+    struct tp_volume v;
+
+    if (!mkdtemp(root)) { EXPECT(0); return; }
+
+    own = tp_path_join2(root, "Music");
+    mkdir(own, 0755);
+
+    EXPECT(tp_mount_detect(root, &v) != 0);
+    tp_volume_free(&v);
+    free(own);
+}
+
 int main(void)
 {
     tp_log_set_level(TP_LOG_ERROR);
@@ -525,6 +614,9 @@ int main(void)
     test_missing_music();
     test_browse_listing();
     test_browse_paths();
+    test_mount_music_folder_beside_ipod_control();
+    test_mount_named_ipod_control();
+    test_mount_plain_music_folder_is_not_a_volume();
     test_mount_bad_cli_falls_through();
     test_sink_resample();
     if (g_fail) {
