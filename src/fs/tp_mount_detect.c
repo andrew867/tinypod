@@ -154,6 +154,22 @@ int tp_mount_detect(const char *cli_mount, struct tp_volume *out)
     memset(out, 0, sizeof(*out));
     out->health = TP_VOL_NOT_FOUND;
 
+    /*
+     * An explicit --mount is tried first and is not the last word.
+     *
+     * This used to return failure the moment the named path had no library
+     * on it, while TINYPOD_MOUNT right below fell through to the rest of the
+     * search. The asymmetry was not deliberate and it cost a working
+     * library: started from the launcher, TinyPod is handed --mount by
+     * n31-autostart, and if the shell's guess is off - the apps directory
+     * rather than the volume it sits on, say - the answer was an empty
+     * library. Typed by hand with no --mount, the same binary on the same
+     * disk found everything.
+     *
+     * So it is a hint. If it holds a library, that is the answer; if it does
+     * not, carry on looking and say so, because ending up somewhere other
+     * than where you were told is worth knowing about.
+     */
     if (cli_mount && cli_mount[0]) {
         if (looks_like_ipod_control(cli_mount)) {
             if (try_set_from_ipod_control(out, cli_mount) == 0)
@@ -161,8 +177,7 @@ int tp_mount_detect(const char *cli_mount, struct tp_volume *out)
         }
         if (try_set_from_mount(out, cli_mount) == 0)
             return 0;
-        out->health = TP_VOL_NOT_FOUND;
-        return -1;
+        tp_info("no library at %s - looking elsewhere", cli_mount);
     }
 
     env = getenv("TINYPOD_MOUNT");
@@ -176,12 +191,18 @@ int tp_mount_detect(const char *cli_mount, struct tp_volume *out)
     }
 
     for (i = 0; k_known_mounts[i]; i++) {
-        if (try_set_from_mount(out, k_known_mounts[i]) == 0)
+        if (try_set_from_mount(out, k_known_mounts[i]) == 0) {
+            if (cli_mount && cli_mount[0])
+                tp_info("using %s instead", out->mount_root);
             return 0;
+        }
     }
 
-    if (probe_proc_mounts(out) == 0)
+    if (probe_proc_mounts(out) == 0) {
+        if (cli_mount && cli_mount[0])
+            tp_info("using %s instead", out->mount_root);
         return 0;
+    }
 
     out->health = TP_VOL_NOT_FOUND;
     return -1;

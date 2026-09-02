@@ -324,6 +324,57 @@ static void test_sink_resample(void)
 }
 
 
+
+/*
+ * A --mount that is wrong must not be the end of it.
+ *
+ * n31-autostart works the volume out in shell and passes it with --mount. If
+ * that guess is off - the apps directory rather than the volume it sits on,
+ * which is exactly what a mis-stripped suffix produces - TinyPod used to
+ * return "no volume" and show an empty library, while the same binary run by
+ * hand with no --mount found everything. TINYPOD_MOUNT already fell through;
+ * --mount did not.
+ */
+static void test_mount_bad_cli_falls_through(void)
+{
+    char root[] = "/tmp/tp_mount_XXXXXX";
+    char *real, *ic, *it, *mu, *wrong;
+    struct tp_volume v;
+
+    if (!mkdtemp(root)) { EXPECT(0); return; }
+
+    /* A volume with a library on it... */
+    real = tp_path_join2(root, "volume");
+    mkdir(real, 0755);
+    ic = tp_path_join2(real, "iPod_Control");
+    mkdir(ic, 0755);
+    it = tp_path_join2(ic, "iTunes");
+    mkdir(it, 0755);
+    mu = tp_path_join2(ic, "Music");
+    mkdir(mu, 0755);
+
+    /* ...and a directory that is not one, of the shape the shell gets wrong. */
+    wrong = tp_path_join2(real, "n31os");
+    mkdir(wrong, 0755);
+
+    /* Named directly, the good one is found. */
+    EXPECT(tp_mount_detect(real, &v) == 0);
+    tp_volume_free(&v);
+
+    /*
+     * Named wrongly, with the good one reachable through TINYPOD_MOUNT: the
+     * bad --mount must not stop the search. Before this, detect returned -1
+     * here and the library came up empty.
+     */
+    setenv("TINYPOD_MOUNT", real, 1);
+    EXPECT(tp_mount_detect(wrong, &v) == 0);
+    if (v.mount_root) EXPECT(strcmp(v.mount_root, real) == 0);
+    tp_volume_free(&v);
+    unsetenv("TINYPOD_MOUNT");
+
+    free(real); free(ic); free(it); free(mu); free(wrong);
+}
+
 int main(void)
 {
     tp_log_set_level(TP_LOG_ERROR);
@@ -337,6 +388,7 @@ int main(void)
     test_volume_detect_no_mount();
     test_volume_ipod_control();
     test_missing_music();
+    test_mount_bad_cli_falls_through();
     test_sink_resample();
     if (g_fail) {
         fprintf(stderr, "%d test(s) failed\n", g_fail);

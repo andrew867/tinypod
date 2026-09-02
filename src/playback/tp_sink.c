@@ -177,95 +177,120 @@ static struct tp_sink *alsa_open(int rate, int channels, char *err, size_t errsz
     char cando[128] = "";
 
     /*
-     * Ask the device what it takes before asking it for something else.
+     * What the device says it can do, for the error message only.
      *
-     * tinyalsa opens hw:0,0 and converts nothing, so a rate the codec does
-     * not do is simply a failed open - and the message was "would not open",
-     * which is true and useless. alsa-lib's "default" goes through plughw and
-     * converts, which is the whole reason mpg123 and ffplay play tracks we
-     * refuse. So: find the rate range, move into it if we have to, and say
-     * what the device offered when we still cannot.
+     * It is a range, and hardware rates are not a range: a codec can report
+     * 8000-96000 and accept only the 48 kHz family. Reading two numbers off
+     * this and concluding that 44100 is fine is how we ended up asking for a
+     * rate the hardware does not have, and then reporting that the device
+     * would not open. So it goes in the message and nowhere else.
      */
     {
         struct pcm_params *pp = pcm_params_get(card, device, PCM_OUT);
 
         if (pp) {
-            unsigned int rmin = pcm_params_get_min(pp, PCM_PARAM_RATE);
-            unsigned int rmax = pcm_params_get_max(pp, PCM_PARAM_RATE);
-            unsigned int cmin = pcm_params_get_min(pp, PCM_PARAM_CHANNELS);
-            unsigned int cmax = pcm_params_get_max(pp, PCM_PARAM_CHANNELS);
-
             snprintf(cando, sizeof cando,
                      "device does %u-%u Hz, %u-%u channels",
-                     rmin, rmax, cmin, cmax);
-
-            if (rmin && rmax && ((unsigned)rate < rmin || (unsigned)rate > rmax)) {
-                /* 48000 first: it is what this codec is usually clocked at,
-                   and resampling 44100 to it is the common case. */
-                unsigned int pick = 48000;
-                if (pick < rmin || pick > rmax)
-                    pick = (unsigned)rate < rmin ? rmin : rmax;
-                s->rate = (int)pick;
-            }
-            if (cmin && (unsigned)channels < cmin)
-                s->channels = (int)cmin;
-            if (cmax && (unsigned)s->channels > cmax)
-                s->channels = (int)cmax;
-
+                     pcm_params_get_min(pp, PCM_PARAM_RATE),
+                     pcm_params_get_max(pp, PCM_PARAM_RATE),
+                     pcm_params_get_min(pp, PCM_PARAM_CHANNELS),
+                     pcm_params_get_max(pp, PCM_PARAM_CHANNELS));
             pcm_params_free(pp);
         }
     }
 
-    rate = s->rate;
-    channels = s->channels;
+    /*
+     * The rates to try, in order. The track's own comes first, because that
+     * is the one needing no conversion; then the families this hardware
+     * plausibly has, 48 kHz first since a 12 MHz master clock divides into it
+     * and never into 44.1.
+     *
+     * The open is the authority. A rate that is not in the hardware's set
+     * fails here and costs nothing, which is what makes gaps in that set a
+     * non-problem - no enumeration, no interval arithmetic, no guessing.
+     */
+    static const int RATES[] = { 0, 48000, 44100, 32000, 96000, 88200,
+                                 24000, 22050, 16000, 8000 };
+    unsigned int r, nr = sizeof RATES / sizeof RATES[0];
 
-    if ((e = getenv("TINYPOD_ALSA_PERIOD_MS")) != NULL)
-        want_ms = (unsigned int)strtoul(e, NULL, 10);
-    if ((e = getenv("TINYPOD_ALSA_PERIODS")) != NULL)
-        want_count = (unsigned int)strtoul(e, NULL, 10);
+    /*
+     * Channels the same way. A device that only does stereo refuses a mono
+     * open outright, and a mono track is not rare enough to lose - the remix
+     * on the way in costs a copy.
+     */
+    int chans[2] = { channels, channels == 2 ? 0 : 2 };
+    unsigned int c;
 
-    for (i = 0; i < n; i++) {
-        unsigned int ms = want_ms ? want_ms : SHAPES[i].ms;
-        unsigned int count = want_count ? want_count : SHAPES[i].count;
-        size_t used = strlen(tried);
+    for (r = 0; r < nr; r++) {
+        int want = RATES[r] ? RATES[r] : rate;
 
-        /* A whole number of frames, or a power of two if the rate will not
-           divide evenly - 44100 gives 882 at 20 ms, 22050 gives 441. */
-        period = ((unsigned int)rate * ms) / 1000u;
-        if (period == 0 || ((unsigned int)rate * ms) % 1000u)
-            period = 1024u;
+        if (RATES[r] && RATES[r] == rate)
+            continue;                    /* already tried as the track rate */
+        if (want <= 0)
+            continue;
 
-        memset(&cfg, 0, sizeof(cfg));
-        cfg.channels = (unsigned int)channels;
-        cfg.rate = (unsigned int)rate;
-        cfg.format = PCM_FORMAT_S16_LE;
-        cfg.period_size = period;
-        cfg.period_count = count;
-        /*
-         * Start with the buffer full rather than half full. Half a buffer is
-         * half the time to the first underrun, and the decoder is at its
-         * slowest at the beginning of a track - the file is being opened and
-         * the first frame parsed while the device is already playing.
-         */
-        cfg.start_threshold = period * count;
-        cfg.stop_threshold = period * count;
-        cfg.silence_threshold = 0;
-        cfg.avail_min = period;
+      for (c = 0; c < 2; c++) {
+        int wantc = chans[c];
 
-        s->pcm = pcm_open(card, device, PCM_OUT, &cfg);
-        if (s->pcm && pcm_is_ready(s->pcm)) {
-            s->period_frames = period;
-            s->periods = count;
-            return s;
+        if (wantc <= 0)
+            continue;
+
+        for (i = 0; i < n; i++) {
+            unsigned int ms = want_ms ? want_ms : SHAPES[i].ms;
+            unsigned int count = want_count ? want_count : SHAPES[i].count;
+            size_t used = strlen(tried);
+
+            /* A whole number of frames, or a power of two if the rate will
+               not divide evenly - 44100 gives 882 at 20 ms. */
+            period = ((unsigned int)want * ms) / 1000u;
+            if (period == 0 || ((unsigned int)want * ms) % 1000u)
+                period = 1024u;
+
+            memset(&cfg, 0, sizeof(cfg));
+            cfg.channels = (unsigned int)wantc;
+            cfg.rate = (unsigned int)want;
+            cfg.format = PCM_FORMAT_S16_LE;
+            cfg.period_size = period;
+            cfg.period_count = count;
+            /*
+             * Start with the buffer full rather than half full. Half a buffer
+             * is half the time to the first underrun, and the decoder is at
+             * its slowest at the beginning of a track - the file is being
+             * opened and the first frame parsed while the device is already
+             * playing.
+             */
+            cfg.start_threshold = period * count;
+            cfg.stop_threshold = period * count;
+            cfg.silence_threshold = 0;
+            cfg.avail_min = period;
+
+            s->pcm = pcm_open(card, device, PCM_OUT, &cfg);
+            if (s->pcm && pcm_is_ready(s->pcm)) {
+                unsigned int got = pcm_get_rate(s->pcm);
+                unsigned int gotc = pcm_get_channels(s->pcm);
+
+                /*
+                 * What it gave us, not what we asked for. A driver that
+                 * accepts a rate and then clocks a different one plays
+                 * everything at the wrong speed, and the converter can only
+                 * correct for it if it is told.
+                 */
+                s->rate = got ? (int)got : want;
+                s->channels = gotc ? (int)gotc : wantc;
+                s->period_frames = period;
+                s->periods = count;
+                return s;
+            }
+            snprintf(tried + used, sizeof(tried) - used, "%s%u@%ux%d",
+                     used ? ", " : "", count, (unsigned)want, wantc);
+            if (s->pcm) {
+                pcm_close(s->pcm);
+                s->pcm = NULL;
+            }
+            if (want_ms || want_count)
+                break;                   /* pinned by hand: one shape only */
         }
-        snprintf(tried + used, sizeof(tried) - used, "%s%ux%ums",
-                 used ? ", " : "", count, ms);
-        if (s->pcm) {
-            pcm_close(s->pcm);
-            s->pcm = NULL;
-        }
-        if (want_ms || want_count)
-            break;                      /* pinned by hand: one attempt only */
+      }
     }
 
     fail(err, errsz, "ALSA card %u device %u would not open at %d Hz %d ch.\n%s\ntried %s",
