@@ -1,7 +1,12 @@
 #include "tp_sink.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdarg.h>
+
+#ifdef TP_WITH_SOXR
+#include <soxr.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,9 +82,15 @@ struct tp_sink {
      */
     int      src_rate;
     int      src_channels;
-    int16_t  last[2];        /* previous input frame, for interpolation */
-    int      have_last;
-    uint32_t pos_q16;        /* where we are between last and the next frame */
+#ifdef TP_WITH_SOXR
+    soxr_t   soxr;           /* VHQ, created on first use */
+#endif
+    float   *taps;           /* SRC_PHASES x SRC_TAPS, built at first use */
+    float    hist[2][32];    /* SRC_TAPS of input history, per channel */
+    int      primed;         /* input samples seen, until the window is full */
+    uint32_t pos_q16;        /* fractional position, carried across blocks */
+    int16_t *mix;            /* remixed input, when the counts differ */
+    size_t   mix_frames;
     int16_t *conv;
     size_t   conv_frames;    /* capacity, in device frames */
 };
@@ -450,37 +461,143 @@ struct tp_sink *tp_sink_open_wav(const char *path, int rate, int channels,
 
 /* ---------------------------------------------------- rate and channels --- */
 /*
- * Linear interpolation, and no apology for it.
+ * A Kaiser-windowed sinc polyphase resampler.
  *
- * This exists so a track whose rate the codec will not take plays at all,
- * which it did not before: tinyalsa converts nothing, so 44.1 kHz into a
- * 48 kHz-only device was a failed open and an error on screen. Linear
- * resampling has audible imaging above about 15 kHz on a 44.1 -> 48 ratio.
- * It is still the right trade against silence, and against carrying a
- * polyphase filter and its tables in a binary that lives in 55 MiB of RAM.
+ * This exists because tinyalsa converts nothing: it opens hw:0,0 and hands
+ * the hardware exactly what it is given, so a codec clocked at 48 kHz refuses
+ * a 44.1 kHz track outright. alsa-lib's "default" is plughw and resamples in
+ * userspace, which is why mpg123 and ffplay played tracks we would not.
  *
- * The wide build links swresample already and could do better; that is worth
- * doing once there is a device to hear the difference on.
+ * It was linear interpolation first, which is a two-tap triangular filter:
+ * several dB of droop across the top of the band and images only about 25 dB
+ * down. Audible, and not what to ship.
  *
- * State carries across calls - the last input frame and the fractional
- * position - because the decoder hands us arbitrary block sizes and a
- * resampler that restarts every block clicks at every boundary.
+ * Not libsoxr. The wide build already links swresample, so soxr would make
+ * three resamplers in one tree; and the lean build lives in an initramfs,
+ * which is a tmpfs resident for the whole session, where another library is a
+ * permanent cost on a machine with 55 MiB. This is one implementation both
+ * builds share, about a hundred lines, with its table built at open time
+ * rather than compiled in.
+ *
+ * Shape: 32 taps, 256 phases. The taps are float and the device has VFPv3-D16,
+ * so this is roughly 3M multiply-accumulates a second at 48 kHz stereo -
+ * comfortably within budget on a Cortex-A8 that is otherwise waiting on NAND.
+ *
+ * Cutoff follows the direction. Upsampling keeps the whole source band
+ * (fc = 1); downsampling lowers it to the destination's Nyquist so nothing
+ * folds back. Each phase is normalised to unit sum, or the passband would sit
+ * a fraction of a dB off flat and drift with the phase.
  */
-static int convert(struct tp_sink *s, const int16_t *in, int in_frames)
+/* Only compiled when soxr is not linked: it is the fallback, not a second
+   engine to choose between at runtime. */
+#ifndef TP_WITH_SOXR
+#define SRC_TAPS   32
+#define SRC_PHASES 256
+#define SRC_CENTRE (SRC_TAPS / 2)
+
+/* Modified Bessel function of the first kind, order 0, by its series. It
+   converges quickly for the arguments a Kaiser window asks for. */
+static double bessel_i0(double x)
+{
+    double sum = 1.0, term = 1.0;
+    int k;
+
+    for (k = 1; k < 32; k++) {
+        term *= (x / (2.0 * k)) * (x / (2.0 * k));
+        sum += term;
+        if (term < sum * 1e-12)
+            break;
+    }
+    return sum;
+}
+
+static double sinc_pi(double x)
+{
+    if (x > -1e-9 && x < 1e-9)
+        return 1.0;
+    x *= 3.14159265358979323846;
+    return sin(x) / x;
+}
+
+/*
+ * Build the phase table. beta = 8.6 puts the stopband around -80 dB, which is
+ * below the noise floor of anything 16-bit that reaches this.
+ */
+static int src_build(struct tp_sink *s)
+{
+    const double beta = 8.6;
+    double fc = (double)s->rate / (double)s->src_rate;
+    double i0b;
+    unsigned ph;
+
+    if (fc > 1.0)
+        fc = 1.0;                 /* upsampling: keep the whole source band */
+
+    s->taps = malloc(sizeof(float) * SRC_PHASES * SRC_TAPS);
+    if (!s->taps)
+        return -1;
+
+    i0b = bessel_i0(beta);
+
+    for (ph = 0; ph < SRC_PHASES; ph++) {
+        double p = (double)ph / (double)SRC_PHASES;
+        double sum = 0.0;
+        int j;
+
+        for (j = 0; j < SRC_TAPS; j++) {
+            /* Distance from the output position to input sample j, in input
+               samples. The output sits p past hist[SRC_CENTRE - 1]. */
+            double x = ((double)SRC_CENTRE - 1.0 + p) - (double)j;
+            double w = x / (double)SRC_CENTRE;      /* -1 .. 1 across the window */
+            double t;
+
+            if (w < -1.0 || w > 1.0) {
+                s->taps[ph * SRC_TAPS + j] = 0.0f;
+                continue;
+            }
+            t = fc * sinc_pi(fc * x) *
+                bessel_i0(beta * sqrt(1.0 - w * w)) / i0b;
+            s->taps[ph * SRC_TAPS + j] = (float)t;
+            sum += t;
+        }
+
+        /* Unit gain at DC, per phase. */
+        if (sum > 1e-9)
+            for (j = 0; j < SRC_TAPS; j++)
+                s->taps[ph * SRC_TAPS + j] /= (float)sum;
+    }
+    return 0;
+}
+
+static int16_t clamp16(float v)
+{
+    if (v > 32767.0f)  return 32767;
+    if (v < -32768.0f) return -32768;
+    return (int16_t)(v < 0.0f ? v - 0.5f : v + 0.5f);
+}
+
+/*
+ * Convert one block. State carries across calls - the tap history and the
+ * fractional position - because the decoder hands over arbitrary block sizes
+ * and a filter that restarts at each block boundary clicks at every one.
+ */
+static int convert_builtin(struct tp_sink *s, const int16_t *in, int in_frames)
 {
     uint32_t step;
     size_t need;
     int out = 0;
-    int i;
+    int i, ch;
 
     if (in_frames <= 0)
         return 0;
+    if (!s->taps && src_build(s) != 0)
+        return -1;
 
+    /* Input frames per output frame, Q16. */
     step = (uint32_t)(((uint64_t)s->src_rate << 16) / (uint32_t)s->rate);
     if (!step)
         step = 1;
 
-    /* Worst case out frames, plus a frame of slack for the fraction. */
     need = (size_t)((uint64_t)in_frames * (uint32_t)s->rate /
                     (uint32_t)s->src_rate) + 2;
     if (need > s->conv_frames) {
@@ -492,66 +609,237 @@ static int convert(struct tp_sink *s, const int16_t *in, int in_frames)
         s->conv_frames = need;
     }
 
-    if (!s->have_last) {
-        s->last[0] = in[0];
-        s->last[1] = s->src_channels > 1 ? in[1] : in[0];
-        s->have_last = 1;
-    }
-
     for (i = 0; i < in_frames; i++) {
-        int16_t cur0 = in[(size_t)i * s->src_channels];
-        int16_t cur1 = s->src_channels > 1
-                           ? in[(size_t)i * s->src_channels + 1] : cur0;
+        /* Already remixed to the device's channel count by convert(). */
+        int16_t l = in[(size_t)i * s->channels];
+        int16_t r = s->channels > 1 ? in[(size_t)i * s->channels + 1] : l;
+        int j;
+
+        /* Newest sample at the end; the window is centred SRC_CENTRE back. */
+        for (j = 0; j < SRC_TAPS - 1; j++) {
+            s->hist[0][j] = s->hist[0][j + 1];
+            s->hist[1][j] = s->hist[1][j + 1];
+        }
+        s->hist[0][SRC_TAPS - 1] = (float)l;
+        s->hist[1][SRC_TAPS - 1] = (float)r;
+
+        if (s->primed < SRC_TAPS) {
+            /* Still filling the window. Nothing to emit that would not be
+               filtered against samples that do not exist yet. */
+            s->primed++;
+            continue;
+        }
 
         while (s->pos_q16 < 65536u && (size_t)out < s->conv_frames) {
-            uint32_t f = s->pos_q16;
-            int32_t l = s->last[0] + (((int32_t)cur0 - s->last[0]) * (int32_t)f >> 16);
-            int32_t r = s->last[1] + (((int32_t)cur1 - s->last[1]) * (int32_t)f >> 16);
+            const float *t = s->taps +
+                (size_t)(s->pos_q16 >> (16 - 8)) % SRC_PHASES * SRC_TAPS;
+            float acc[2] = { 0.0f, 0.0f };
 
-            s->conv[(size_t)out * s->channels] = (int16_t)l;
-            if (s->channels > 1)
-                s->conv[(size_t)out * s->channels + 1] = (int16_t)r;
+            for (j = 0; j < SRC_TAPS; j++) {
+                acc[0] += s->hist[0][j] * t[j];
+                acc[1] += s->hist[1][j] * t[j];
+            }
+            for (ch = 0; ch < s->channels; ch++)
+                s->conv[(size_t)out * s->channels + ch] =
+                    clamp16(acc[ch > 1 ? 1 : ch]);
             out++;
             s->pos_q16 += step;
         }
         s->pos_q16 -= 65536u;
-        s->last[0] = cur0;
-        s->last[1] = cur1;
     }
     return out;
 }
+#endif /* !TP_WITH_SOXR */
+
+#ifdef TP_WITH_SOXR
+/*
+ * libsoxr at VHQ.
+ *
+ * This is not an optimisation over the filter above; it is the reason the
+ * filter above exists as a fallback rather than as the answer. soxr's VHQ
+ * setting is flat to 20 kHz with images below -100 dB. The built-in one is
+ * 32 taps and 256 phases, which is respectable and audibly worse.
+ *
+ * It matters more here than it would elsewhere: the codec clock is 12 MHz,
+ * which divides into 48 kHz and never into 44.1 kHz, so nearly every track in
+ * an iTunes library goes through this on its way out. It is not a fallback
+ * path, it is the path.
+ *
+ * Interleaved int16 in and out, one soxr for the life of the sink, so its
+ * filter state carries across blocks the way the built-in one's does.
+ */
+static int convert_soxr(struct tp_sink *s, const int16_t *in, int in_frames)
+{
+    size_t idone = 0, odone = 0;
+    size_t need;
+
+    if (!s->soxr) {
+        soxr_io_spec_t io = soxr_io_spec(SOXR_INT16_I, SOXR_INT16_I);
+        /*
+         * HQ, not VHQ. HQ is soxr's 20-bit setting and the sink is 16-bit,
+         * so VHQ's extra eight bits of stopband go somewhere the hardware
+         * cannot represent - and they are not free on a Cortex-A8 running
+         * soxr's scalar engine, which is what this is: the SIMD ones are
+         * built for a CPU this is not. Set TINYPOD_SOXR_QUALITY=vhq to try
+         * it on the device, which is the only place the cost is real.
+         */
+        const char *qs = getenv("TINYPOD_SOXR_QUALITY");
+        unsigned long recipe = SOXR_HQ;
+        soxr_quality_spec_t q;
+        soxr_error_t e = NULL;
+
+        if (qs && strcmp(qs, "vhq") == 0)
+            recipe = SOXR_VHQ;
+        else if (qs && strcmp(qs, "mq") == 0)
+            recipe = SOXR_MQ;
+        q = soxr_quality_spec(recipe, 0);
+
+        s->soxr = soxr_create((double)s->src_rate, (double)s->rate,
+                              (unsigned)s->channels, &e, &io, &q, NULL);
+        if (!s->soxr || e)
+            return -1;
+    }
+
+    /* soxr can hold samples back, so ask for the ratio plus a margin rather
+       than assuming a fixed relationship between in and out. */
+    need = (size_t)((uint64_t)in_frames * (uint32_t)s->rate /
+                    (uint32_t)s->src_rate) + 32;
+    if (need > s->conv_frames) {
+        int16_t *nb = realloc(s->conv, need * (size_t)s->channels *
+                                       sizeof(int16_t));
+        if (!nb)
+            return -1;
+        s->conv = nb;
+        s->conv_frames = need;
+    }
+
+    if (soxr_process(s->soxr, in, (size_t)in_frames, &idone,
+                     s->conv, s->conv_frames, &odone) != NULL)
+        return -1;
+    return (int)odone;
+}
+#endif
 
 /*
- * The same code the sink runs, reachable from a test.
+ * Channels first, into what the device asked for.
  *
- * This conversion only happens on a device whose codec refuses the track's
- * rate, which is not something a host build can arrange - so without a hook
- * the resampler would ship having never been executed. It builds its own
- * sink rather than taking a second copy of the arithmetic.
+ * Kept separate from the rate change because soxr does not do it: it is
+ * created for a channel count and expects that many in and out, so handing it
+ * interleaved mono while telling it stereo makes it read one frame's left and
+ * the next frame's right. Mono is duplicated, and anything wider than the
+ * device takes is dropped to its first channels rather than folded down - a
+ * fold needs gain decisions this has no business making.
  */
-int tp_sink_convert_test(int src_rate, int dst_rate, int src_ch, int dst_ch,
-                         const int16_t *in, int in_frames,
-                         int16_t *out, int out_cap_frames)
+static const int16_t *remix(struct tp_sink *s, const int16_t *in, int frames)
 {
-    struct tp_sink s;
-    int got;
+    int i, ch;
 
-    if (!in || !out || src_rate <= 0 || dst_rate <= 0)
+    if (s->src_channels == s->channels)
+        return in;
+
+    if ((size_t)frames > s->mix_frames) {
+        int16_t *nb = realloc(s->mix, (size_t)frames * (size_t)s->channels *
+                                      sizeof(int16_t));
+        if (!nb)
+            return NULL;
+        s->mix = nb;
+        s->mix_frames = (size_t)frames;
+    }
+
+    for (i = 0; i < frames; i++) {
+        for (ch = 0; ch < s->channels; ch++) {
+            int src = ch < s->src_channels ? ch : s->src_channels - 1;
+            s->mix[(size_t)i * s->channels + ch] =
+                in[(size_t)i * s->src_channels + src];
+        }
+    }
+    return s->mix;
+}
+
+/*
+ * One conversion, whichever engine is compiled in. Callers - and the test -
+ * do not choose, so what ships is what the tests ran against.
+ */
+static int convert(struct tp_sink *s, const int16_t *in, int in_frames)
+{
+    if (in_frames <= 0)
+        return 0;
+
+    in = remix(s, in, in_frames);
+    if (!in)
         return -1;
 
-    memset(&s, 0, sizeof s);
-    s.kind = SINK_ALSA;
-    s.rate = dst_rate;
-    s.channels = dst_ch;
-    s.src_rate = src_rate;
-    s.src_channels = src_ch;
+    if (s->src_rate == s->rate) {
+        /* Channels changed, rate did not. Nothing for a filter to do. */
+        if ((size_t)in_frames > s->conv_frames) {
+            int16_t *nb = realloc(s->conv, (size_t)in_frames *
+                                           (size_t)s->channels *
+                                           sizeof(int16_t));
+            if (!nb)
+                return -1;
+            s->conv = nb;
+            s->conv_frames = (size_t)in_frames;
+        }
+        memcpy(s->conv, in,
+               (size_t)in_frames * (size_t)s->channels * sizeof(int16_t));
+        return in_frames;
+    }
 
-    got = convert(&s, in, in_frames);
+#ifdef TP_WITH_SOXR
+    return convert_soxr(s, in, in_frames);
+#else
+    return convert_builtin(s, in, in_frames);
+#endif
+}
+
+/*
+ * The same conversion the sink runs, reachable from a test.
+ *
+ * It only happens on a device whose codec refuses the track's rate - tinyalsa
+ * converts nothing, unlike alsa-lib's plughw - which is not something a host
+ * build can arrange. Without this the resampler would ship having never been
+ * called once.
+ *
+ * A converter rather than a function, because the state is the interesting
+ * part: both engines carry filter history across blocks, and soxr will not
+ * return a sample until its filter has filled. A per-call hook tested neither
+ * and quietly hid the latency.
+ */
+struct tp_sink *tp_sink_convert_open(int src_rate, int dst_rate,
+                                     int src_ch, int dst_ch)
+{
+    struct tp_sink *s;
+
+    if (src_rate <= 0 || dst_rate <= 0 || src_ch <= 0 || dst_ch <= 0)
+        return NULL;
+
+    s = calloc(1, sizeof(*s));
+    if (!s)
+        return NULL;
+
+    s->kind = SINK_ALSA;      /* no pcm: close() checks before touching it */
+    s->fd = -1;
+    s->rate = dst_rate;
+    s->channels = dst_ch;
+    s->src_rate = src_rate;
+    s->src_channels = src_ch;
+    return s;
+}
+
+int tp_sink_convert_block(struct tp_sink *s, const int16_t *in, int in_frames,
+                          int16_t *out, int out_cap_frames)
+{
+    int got;
+
+    if (!s || !in || !out)
+        return -1;
+
+    got = convert(s, in, in_frames);
     if (got > out_cap_frames)
         got = out_cap_frames;
     if (got > 0)
-        memcpy(out, s.conv, (size_t)got * (size_t)dst_ch * sizeof(int16_t));
-    free(s.conv);
+        memcpy(out, s->conv,
+               (size_t)got * (size_t)s->channels * sizeof(int16_t));
     return got;
 }
 
@@ -668,7 +956,13 @@ int tp_sink_describe(const struct tp_sink *s, char *out, size_t cap)
         unsigned long ms = (unsigned long)s->period_frames * s->periods *
                            1000ul / (unsigned long)s->rate;
         if (s->src_rate != s->rate)
-            snprintf(out, cap, "alsa %lu ms %d>%d", ms, s->src_rate, s->rate);
+            snprintf(out, cap, "alsa %lu ms %d>%d %s", ms, s->src_rate, s->rate,
+#ifdef TP_WITH_SOXR
+                     "soxr"
+#else
+                     "sinc"
+#endif
+                     );
         else
             snprintf(out, cap, "alsa %lu ms", ms);
     } else {
@@ -756,6 +1050,12 @@ void tp_sink_close(struct tp_sink *s)
     if (s->kind == SINK_ALSA && s->pcm)
         pcm_close(s->pcm);
     free(s->conv);
+    free(s->mix);
+    free(s->taps);
+#ifdef TP_WITH_SOXR
+    if (s->soxr)
+        soxr_delete(s->soxr);
+#endif
 #endif
 #ifdef TINYPOD_HAVE_OSS
     if (s->kind == SINK_OSS && s->fd >= 0)

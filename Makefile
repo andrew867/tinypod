@@ -18,7 +18,7 @@ UI_LVGL ?= 0
 # reused objects compiled for the wrong configuration, and the failure was an
 # undefined reference to a function that is right there in the source. Cheap
 # to avoid, and confusing to debug.
-BUILD  := build/$(TARGET)$(if $(filter 1,$(UI_LVGL)),-lvgl,)$(if $(filter 1,$(FFMPEG)),-ff,)
+BUILD  := build/$(TARGET)$(if $(filter 1,$(UI_LVGL)),-lvgl,)$(if $(filter 1,$(FFMPEG)),-ff,)$(if $(filter 1,$(SOXR)),-sx,)
 OUT    := out/$(TARGET)
 
 SRC_APP := \
@@ -119,6 +119,27 @@ ifeq ($(FFMPEG),1)
                  $(FFMPEG_DIR)/lib/libavutil.a
 endif
 
+# libsoxr, for the resampling this device cannot avoid.
+#
+# The codec's master clock is 12 MHz, which divides exactly into the 48 kHz
+# family and never into the 44.1 kHz one, so the hardware runs at 48 kHz and
+# most of an iTunes library has to be resampled to reach it. tinyalsa converts
+# nothing and alsa-lib's built-in converter is linear, so it happens here.
+#
+#   ./tools/fetch-soxr.sh                                host library
+#   CROSS=<prefix> ./tools/fetch-soxr.sh                 device library
+#   make SOXR=1 ...
+#
+# Without it the sink falls back to its own windowed-sinc polyphase filter,
+# which is good enough to ship and not as good as soxr's VHQ.
+SOXR ?= 0
+ifeq ($(SOXR),1)
+  SOXR_DIR ?= third_party/soxr-build/$(TARGET)
+  INCLUDES += -I$(SOXR_DIR)/include
+  CDEFS += -DTP_WITH_SOXR=1
+  SOXR_LIB := $(SOXR_DIR)/lib/libsoxr.a
+endif
+
 # tinyalsa: point at an unpacked tinyalsa tree to get real audio output.
 # Without it the build still decodes (see the "decode" command) but cannot play.
 TINYALSA_DIR ?=
@@ -146,13 +167,13 @@ ifeq ($(TARGET),n31)
   ARCH := -mcpu=cortex-a8 -mfpu=vfpv3-d16 -mfloat-abi=softfp
   CFLAGS := -Os $(ARCH) -static $(WARN) $(INCLUDES) $(CDEFS) -DTINYPOD_N31
   DECFLAGS := -O2 $(ARCH) -DARM $(INCLUDES) $(CDEFS)
-  LDFLAGS := -static $(TINYALSA_LIB) $(LVGL_LIB) $(FFMPEG_LIBS) -lpthread -ldl -lm
+  LDFLAGS := -static $(TINYALSA_LIB) $(LVGL_LIB) $(FFMPEG_LIBS) $(SOXR_LIB) -lpthread -ldl -lm
 else
   CC ?= gcc
   ARCH :=
   CFLAGS := -O2 -g $(WARN) $(INCLUDES) $(CDEFS)
   DECFLAGS := -O2 $(INCLUDES) $(CDEFS)
-  LDFLAGS := $(TINYALSA_LIB) $(LVGL_LIB) $(FFMPEG_LIBS) -lpthread -ldl -lm
+  LDFLAGS := $(TINYALSA_LIB) $(LVGL_LIB) $(FFMPEG_LIBS) $(SOXR_LIB) -lpthread -ldl -lm
 endif
 
 APP_OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRC_APP))

@@ -185,76 +185,144 @@ static void test_missing_music(void)
 /*
  * The sink's rate conversion.
  *
- * tinyalsa hands the hardware exactly what it is given, so a codec that only
- * clocks 48 kHz simply refuses a 44.1 kHz track - which is why mpg123 and
- * ffplay, which go through alsa-lib's plughw and resample, played tracks
- * TinyPod would not. This is the conversion that fixes that, and a host has
- * no way to provoke it, so it is exercised here instead.
+ * The codec's master clock is 12 MHz, which divides exactly into the 48 kHz
+ * family and never into the 44.1 kHz one, so the hardware runs at 48 kHz and
+ * nearly every track in an iTunes library is resampled on its way out. This
+ * is the common path, and tinyalsa converts nothing, so it happens here.
+ *
+ * A host cannot provoke it - it needs a device that refuses the track's rate -
+ * so it is exercised through the converter hook instead, and measured rather
+ * than eyeballed: a tone in, and how much of what comes out is still that
+ * tone.
  */
+
+/* Energy at one frequency, by Goertzel. Enough to say what fraction of the
+   output is the tone we put in and what fraction is everything else. */
+static double tone_energy(const int16_t *x, int n, int stride,
+                          double freq, double rate)
+{
+    double w = 2.0 * 3.14159265358979 * freq / rate;
+    double c = 2.0 * cos(w);
+    double s1 = 0.0, s2 = 0.0;
+    int i;
+
+    for (i = 0; i < n; i++) {
+        double s0 = (double)x[(size_t)i * stride] + c * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    return s1 * s1 + s2 * s2 - c * s1 * s2;
+}
+
+static double total_energy(const int16_t *x, int n, int stride)
+{
+    double e = 0.0;
+    int i;
+
+    for (i = 0; i < n; i++) {
+        double v = (double)x[(size_t)i * stride];
+        e += v * v;
+    }
+    return e;
+}
+
 static void test_sink_resample(void)
 {
-    enum { IN = 441, CAP = 2048 };
-    int16_t in[IN * 2], out[CAP * 2];
-    int i, got, total;
+    enum { BLK = 441, BLOCKS = 120, CAP = 4096, KEEP = 65536 };
+    static int16_t in[BLK * 2];
+    static int16_t out[CAP * 2];
+    static int16_t all[KEEP * 2];
+    struct tp_sink *c;
+    int total = 0, blk, i;
+    double sig, tot;
 
-    /* A full-scale sine, because interpolation that is not clamped shows up
-       at the rails and nowhere else. */
-    for (i = 0; i < IN; i++) {
-        double t = (double)i / 44100.0;
-        int16_t v = (int16_t)(32767.0 * sin(2.0 * 3.14159265358979 * 440.0 * t));
-        in[i * 2] = v;
-        in[i * 2 + 1] = v;
-    }
+    /* 1 kHz at full scale. Continuous across blocks - a resampler that
+       restarts at a block boundary puts a step in the middle of it, and a
+       step is broadband, which the energy ratio below will see. */
+    c = tp_sink_convert_open(44100, 48000, 2, 2);
+    EXPECT(c != NULL);
+    if (!c) return;
 
-    /* 44100 -> 48000 on 441 frames is 480, give or take the fraction. */
-    got = tp_sink_convert_test(44100, 48000, 2, 2, in, IN, out, CAP);
-    EXPECT(got >= 478 && got <= 482);
+    for (blk = 0; blk < BLOCKS; blk++) {
+        int got;
 
-    /* Nothing left the int16 range by wrapping: a sample that should be near
-       full scale must not come back near the opposite rail. */
-    {
-        int wrapped = 0;
-        for (i = 1; i < got; i++) {
-            int32_t d = (int32_t)out[i * 2] - (int32_t)out[(i - 1) * 2];
-            if (d > 40000 || d < -40000)
-                wrapped = 1;
+        for (i = 0; i < BLK; i++) {
+            double t = (double)(blk * BLK + i) / 44100.0;
+            int16_t v = (int16_t)(32000.0 * sin(2.0 * 3.14159265358979 * 1000.0 * t));
+            in[i * 2] = v;
+            in[i * 2 + 1] = v;
         }
-        EXPECT(!wrapped);
+        got = tp_sink_convert_block(c, in, BLK, out, CAP);
+        EXPECT(got >= 0);
+        if (got > 0 && total + got <= KEEP) {
+            memcpy(all + (size_t)total * 2, out,
+                   (size_t)got * 2 * sizeof(int16_t));
+            total += got;
+        }
     }
-
-    /* Down as well as up. */
-    got = tp_sink_convert_test(48000, 44100, 2, 2, in, IN, out, CAP);
-    EXPECT(got >= 403 && got <= 407);
-
-    /* Mono in, stereo out, with both channels the same. */
-    {
-        int16_t mono[64];
-        for (i = 0; i < 64; i++) mono[i] = (int16_t)(i * 100);
-        got = tp_sink_convert_test(44100, 44100, 1, 2, mono, 64, out, CAP);
-        EXPECT(got >= 62 && got <= 66);
-        for (i = 0; i < got; i++)
-            EXPECT(out[i * 2] == out[i * 2 + 1]);
-    }
+    tp_sink_close(c);
 
     /*
-     * Block boundaries. The decoder hands over arbitrary block sizes, and a
-     * resampler that restarts each time clicks at every seam - so the
-     * fractional position and the previous frame carry across calls. Four
-     * quarter-blocks must produce what one whole block does, not four
-     * independent runs of it.
+     * 120 blocks of 441 at 44100 is 52920 frames, which is 57600 at 48000.
+     *
+     * A resampler ends with its filter still full - soxr holds 941 frames at
+     * this ratio - so the count comes up a little short and that is correct
+     * rather than a fault. What the bound is really for is the other
+     * direction: an engine that quietly passed audio through unconverted
+     * would return 52920, and there is no tolerance that accepts a delay of
+     * a thousand frames and also accepts being short by five thousand.
      */
-    total = 0;
-    for (i = 0; i < 4; i++) {
-        got = tp_sink_convert_test(44100, 48000, 2, 2,
-                                   in + i * (IN / 4) * 2, IN / 4,
-                                   out, CAP);
-        EXPECT(got > 0);
-        total += got;
+    printf("  resample: %d frames out, 52920 in (44100->48000)\n", total);
+    EXPECT(total >= 56400 && total <= 57600);
+
+    /*
+     * What fraction of the output is still a 1 kHz tone. The first frames are
+     * the filter filling, so they are skipped.
+     *
+     * Linear interpolation manages about 0.98 here; a windowed sinc is beyond
+     * 0.999. The bound is set where it separates the two, so a silent fall
+     * back to something cheap fails rather than passes quietly.
+     */
+    if (total > 2048) {
+        int n = total - 1024;
+        if (n > 8192) n = 8192;
+        sig = tone_energy(all + 1024 * 2, n, 2, 1000.0, 48000.0);
+        tot = total_energy(all + 1024 * 2, n, 2);
+        EXPECT(tot > 0.0);
+        /* Goertzel's single bin comes to A^2 n^2 / 4 for a real sinusoid,
+           and the total energy to n A^2 / 2, so their ratio is n/2. Divide
+           by that and a pure tone reads 1. */
+        printf("  resample: %.5f of the output is the 1 kHz tone\n",
+               sig / tot / ((double)n * 0.5));
+        EXPECT(sig / tot / ((double)n * 0.5) > 0.995);
     }
-    /* Four independent runs would each round the same way and drift; allow a
-       frame per call for the fraction and no more. */
-    EXPECT(total >= 476 && total <= 484);
+
+    /* Mono in, stereo out, both channels identical. */
+    c = tp_sink_convert_open(44100, 44100, 1, 2);
+    EXPECT(c != NULL);
+    if (c) {
+        static int16_t mono[256];
+        int got;
+
+        for (i = 0; i < 256; i++)
+            mono[i] = (int16_t)(1000 * sin(i * 0.05));
+        got = tp_sink_convert_block(c, mono, 256, out, CAP);
+        EXPECT(got >= 0);
+        for (i = 0; i < got; i++)
+            EXPECT(out[i * 2] == out[i * 2 + 1]);
+        tp_sink_close(c);
+    }
+
+    /* Downwards as well as up, and not more frames than the ratio allows. */
+    c = tp_sink_convert_open(48000, 44100, 2, 2);
+    EXPECT(c != NULL);
+    if (c) {
+        int got = tp_sink_convert_block(c, in, BLK, out, CAP);
+        EXPECT(got >= 0 && got <= 406);
+        tp_sink_close(c);
+    }
 }
+
 
 int main(void)
 {

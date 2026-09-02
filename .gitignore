@@ -34,3 +34,6 @@ testdata/formats/
 
 # Screens are committed as PNG; the renderer writes BMP first.
 docs/images/*.bmp
+third_party/soxr-*/
+third_party/soxr-build/
+third_party/soxr-*.tar.xz

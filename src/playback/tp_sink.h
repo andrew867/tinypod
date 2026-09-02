@@ -40,11 +40,16 @@ int tp_sink_describe(const struct tp_sink *s, char *out, size_t cap);
  * It only runs on a device whose codec refuses the track's rate - tinyalsa
  * converts nothing, unlike alsa-lib's plughw - which is not a situation a
  * host build can arrange, so without this the resampler would ship having
- * never run. Returns frames written to out, or -1.
+ * never run.
+ *
+ * A converter rather than a one-shot call: both engines carry filter state
+ * across blocks, and soxr returns nothing at all until its filter has filled.
+ * Close it with tp_sink_close. Returns frames written to out, or -1.
  */
-int tp_sink_convert_test(int src_rate, int dst_rate, int src_ch, int dst_ch,
-                         const int16_t *in, int in_frames,
-                         int16_t *out, int out_cap_frames);
+struct tp_sink *tp_sink_convert_open(int src_rate, int dst_rate,
+                                     int src_ch, int dst_ch);
+int tp_sink_convert_block(struct tp_sink *s, const int16_t *in, int in_frames,
+                          int16_t *out, int out_cap_frames);
 
 /*
  * Stop and restart the stream around a pause. Without this the device simply
