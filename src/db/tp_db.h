@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "tp_io.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,7 +23,15 @@ enum tp_codec {
     TP_CODEC_ALAC,
     TP_CODEC_WAV,
     TP_CODEC_AIFF,
-    TP_CODEC_PROTECTED_UNSUPPORTED
+    TP_CODEC_PROTECTED_UNSUPPORTED,
+    /*
+     * The file is there and its contents would not read. Distinct from
+     * UNKNOWN, which means "read it and did not recognise it" - that is a
+     * format question and this is a storage one, and they were the same
+     * answer until the probe stopped guessing from the extension after an
+     * I/O error.
+     */
+    TP_CODEC_UNREADABLE
 };
 
 enum tp_db_format {
@@ -108,6 +117,13 @@ struct tp_library_health {
     size_t path_casefold;
     size_t path_outside;
     size_t music_folder_count;
+    /*
+     * Files that are there and would not read. They used to land in
+     * track_playable, because the readable check never read anything - so a
+     * volume losing blocks reported a clean bill of health right up until
+     * something tried to play one.
+     */
+    size_t unreadable_files;
     char format_name[32];
     char warnings[8][128];
     size_t warning_count;
@@ -135,6 +151,9 @@ struct tp_library {
     size_t genre_count;
 
     struct tp_library_health health;
+
+    /* Where the load failed, when it did. Kept rather than reduced to -1. */
+    struct tp_io_err io_err;
 };
 
 void tp_track_clear(struct tp_track *t);

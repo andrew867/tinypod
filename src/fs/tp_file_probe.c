@@ -1,6 +1,7 @@
 #include "tp_file_probe.h"
 #include "tp_util.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -36,10 +37,26 @@ enum tp_codec tp_file_probe_codec(const char *path)
         return TP_CODEC_UNKNOWN;
     by_ext = from_ext(path);
 
+    /*
+     * A read that fails is not a short file.
+     *
+     * This used to fall back to the extension whenever the header could not
+     * be read, so a file the storage would not give up was classified by its
+     * name and counted playable - confidently wrong, and invisible until it
+     * came to play it. A genuinely short file still falls back, because that
+     * is a real if unhelpful answer; an I/O error does not.
+     */
+    errno = 0;
     f = fopen(path, "rb");
     if (!f)
-        return by_ext;
+        return errno == ENOENT ? by_ext : TP_CODEC_UNREADABLE;
+
+    errno = 0;
     n = fread(hdr, 1, sizeof(hdr), f);
+    if (n < sizeof(hdr) && ferror(f)) {
+        fclose(f);
+        return TP_CODEC_UNREADABLE;
+    }
     fclose(f);
     if (n < 4)
         return by_ext;

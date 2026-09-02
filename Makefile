@@ -27,6 +27,7 @@ SRC_APP := \
 	src/util/tp_build.c \
 	src/util/tp_diag.c \
 	src/util/tp_log.c \
+	src/util/tp_io.c \
 	src/util/tp_util.c \
 	src/util/tp_config.c \
 	src/fs/tp_browse.c \
@@ -178,6 +179,10 @@ else
 endif
 
 APP_OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRC_APP))
+
+# What each object was built against. Missing on a first build, which is
+# fine - there is nothing stale to catch yet.
+-include $(patsubst src/%.c,$(BUILD)/%.d,$(SRC_APP))
 # Everything but the CLI entry point, for tests that bring their own main.
 APP_OBJS_NOMAIN := $(filter-out $(BUILD)/main.o,$(APP_OBJS))
 SQLITE_OBJ := $(BUILD)/sqlite3.o
@@ -247,9 +252,15 @@ $(OUT)/tinypod: $(APP_OBJS) $(SQLITE_OBJ) $(DEC_OBJS)
 		echo "  staged -> $(IPOD_ARTIFACTS)/$$name"; \
 	fi
 
+#
+# -MMD -MP writes a .d beside each object naming the headers it used, so a
+# changed header rebuilds what depends on it. Without this, editing a struct
+# recompiled whichever files were newer and left the others reading the old
+# layout - which links cleanly and segfaults on the device.
+#
 $(BUILD)/%.o: src/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 .PHONY: BUILD_FORCE
 BUILD_FORCE:

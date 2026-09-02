@@ -271,8 +271,17 @@ void tp_db_validate(struct tp_library *lib)
             h->track_playable++;
         if (!t->file_exists)
             h->missing_files++;
+        /*
+         * There and unreadable, which is neither missing nor an unsupported
+         * format. It used to be counted playable, because the check that
+         * decided never read a byte and the probe fell back to the file's
+         * extension when the read failed.
+         */
+        if (t->codec == TP_CODEC_UNREADABLE)
+            h->unreadable_files++;
         if (t->codec == TP_CODEC_PROTECTED_UNSUPPORTED ||
-            (t->file_exists && !t->playable_probe_ok))
+            (t->file_exists && !t->playable_probe_ok &&
+             t->codec != TP_CODEC_UNREADABLE))
             h->unsupported_codec++;
         for (j = i + 1; j < lib->track_count; j++) {
             if (lib->tracks[j].track_id == t->track_id) {
@@ -310,17 +319,38 @@ int tp_db_load(struct tp_library *lib, const char *mount_root,
     default:
         rc = tp_db_load_raw(lib, mount_root, ipod_control_root);
         lib->format = TP_DB_FORMAT_RAW_SCAN;
+        if (rc != 0 && !lib->io_err.set)
+            tp_io_err_set(&lib->io_err, "raw-scan", "no playable files found",
+                          ipod_control_root, -1, 0, 0, 0);
         break;
     }
 
     if (rc != 0 && fmt != TP_DB_FORMAT_RAW_SCAN) {
-        tp_warn("primary library parse failed; falling back to raw scan");
+        /*
+         * Name the reader and what went wrong with it. "Primary parse
+         * failed" told you neither which reader nor which file, and then
+         * quietly substituted a different library - so a volume with a
+         * damaged database came up looking fine but wrong, and nothing said
+         * a word about the substitution.
+         */
+        char line[256];
+
+        if (tp_io_err_format(&lib->io_err, line, sizeof line) == 0)
+            tp_warn("%s - falling back to a folder scan", line);
+        else
+            tp_warn("%s reader failed; falling back to a folder scan",
+                    tp_db_format_name(fmt));
         tp_library_free(lib);
         tp_library_init(lib);
         lib->mount_root = tp_strdup(mount_root);
         lib->ipod_control_root = tp_strdup(ipod_control_root);
+        /* The fallback gets a clean slate to report its own failure in;
+           keeping the first reader's would blame the wrong one. */
+        tp_io_err_clear(&lib->io_err);
         rc = tp_db_load_raw(lib, mount_root, ipod_control_root);
         lib->format = TP_DB_FORMAT_RAW_SCAN;
+        if (rc == 0)
+            tp_warn("using a folder scan: titles come from tags, not iTunes");
     }
 
     if (rc == 0) {

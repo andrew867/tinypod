@@ -1,5 +1,6 @@
 #include "tp_db.h"
 #include "tp_util.h"
+#include "tp_io.h"
 #include "tp_path.h"
 #include "tp_mount.h"
 #include "tp_file_probe.h"
@@ -8,6 +9,7 @@
 #include "tp_browse.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -599,6 +601,91 @@ static void test_mount_plain_music_folder_is_not_a_volume(void)
     free(own);
 }
 
+
+/*
+ * Missing and unreadable have to be different answers.
+ *
+ * They were the same one: tp_is_readable_file did stat, fopen, fclose and
+ * never read a byte, so a file whose data the storage would not give up
+ * passed every check and was counted playable. On a device whose flash
+ * translation layer returns EIO for blocks it has lost, that is the
+ * difference between a library that reports a problem and one that reports
+ * 496 healthy tracks and then plays silence.
+ *
+ * A real EIO cannot be arranged in a unit test, so what is checked here is
+ * the part that can be: the three states are distinguished, an empty file is
+ * readable rather than broken, and the message says which.
+ */
+static void test_file_read_states(void)
+{
+    char root[] = "/tmp/tp_io_XXXXXX";
+    char *good, *empty, *gone, *dir;
+    int e;
+
+    if (!mkdtemp(root)) { EXPECT(0); return; }
+
+    good = tp_path_join2(root, "good.mp3");
+    { FILE *f = fopen(good, "wb"); if (f) { fputs("data", f); fclose(f); } }
+    empty = tp_path_join2(root, "empty.mp3");
+    { FILE *f = fopen(empty, "wb"); if (f) fclose(f); }
+    gone = tp_path_join2(root, "nothing.mp3");
+    dir = tp_path_join2(root, "adir");
+    mkdir(dir, 0755);
+
+    e = -1;
+    EXPECT(tp_file_read_check(good, &e) == TP_FILE_OK);
+    EXPECT(e == 0);
+
+    /* Empty is not damaged. The read has to succeed, not return anything. */
+    EXPECT(tp_file_read_check(empty, NULL) == TP_FILE_OK);
+
+    EXPECT(tp_file_read_check(gone, NULL) == TP_FILE_MISSING);
+    EXPECT(tp_file_read_check(dir, NULL) == TP_FILE_MISSING);
+    EXPECT(tp_file_read_check(NULL, NULL) == TP_FILE_MISSING);
+
+    /* And the old spelling still agrees for the cases it could answer. */
+    EXPECT(tp_is_readable_file(good) == 1);
+    EXPECT(tp_is_readable_file(gone) == 0);
+
+    free(good); free(empty); free(gone); free(dir);
+}
+
+/*
+ * The failure record keeps what the bare -1 threw away, and says "not there"
+ * and "I/O error" differently - which is the whole point of having it.
+ */
+static void test_io_err_record(void)
+{
+    struct tp_io_err e;
+    char line[256];
+
+    tp_io_err_clear(&e);
+    EXPECT(tp_io_err_format(&e, line, sizeof line) == -1);
+
+    tp_io_err_set(&e, "itunescdb", "read", "/mnt/disk/x/iTunesCDB",
+                  4096, 128750, 4096, EIO);
+    EXPECT(tp_io_err_format(&e, line, sizeof line) == 0);
+    EXPECT(strstr(line, "itunescdb") != NULL);
+    EXPECT(strstr(line, "read") != NULL);
+    EXPECT(strstr(line, "I/O error") != NULL);
+    EXPECT(strstr(line, "iTunesCDB") != NULL);
+    EXPECT(strstr(line, "128750") != NULL);
+
+    /* The first failure is the informative one; later ones do not overwrite
+       it, because they are usually consequences of it. */
+    tp_io_err_set(&e, "raw-scan", "open", "/mnt/disk/other", -1, 0, 0, ENOENT);
+    EXPECT(tp_io_err_format(&e, line, sizeof line) == 0);
+    EXPECT(strstr(line, "itunescdb") != NULL);
+
+    /* Missing reads differently from unreadable. */
+    tp_io_err_clear(&e);
+    tp_io_err_set(&e, "sqlite-itdb", "open", "/mnt/disk/Library.itdb",
+                  -1, 0, 0, ENOENT);
+    EXPECT(tp_io_err_format(&e, line, sizeof line) == 0);
+    EXPECT(strstr(line, "not there") != NULL);
+    EXPECT(strstr(line, "I/O error") == NULL);
+}
+
 int main(void)
 {
     tp_log_set_level(TP_LOG_ERROR);
@@ -612,6 +699,8 @@ int main(void)
     test_volume_detect_no_mount();
     test_volume_ipod_control();
     test_missing_music();
+    test_file_read_states();
+    test_io_err_record();
     test_browse_listing();
     test_browse_paths();
     test_mount_music_folder_beside_ipod_control();

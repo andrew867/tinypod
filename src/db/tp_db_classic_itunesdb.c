@@ -5,6 +5,7 @@
 #include "tp_file_probe.h"
 
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -21,30 +22,50 @@ static uint16_t r16le(const unsigned char *p)
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
-static int load_file(const char *path, unsigned char **out, size_t *out_len)
+/*
+ * Read a whole file, saying which step failed rather than -1 five times.
+ *
+ * "Could not open it", "it is shorter than a header", "the storage stopped
+ * halfway through" and "out of memory" are four different problems with four
+ * different answers, and they used to arrive as the same number.
+ */
+static int load_file(const char *path, unsigned char **out, size_t *out_len,
+                     const char *reader, struct tp_io_err *ioe)
 {
     FILE *f;
     long sz;
+    size_t got;
     unsigned char *buf;
+
+    errno = 0;
     f = fopen(path, "rb");
-    if (!f)
+    if (!f) {
+        tp_io_err_set(ioe, reader, "open", path, -1, 0, 0, errno);
         return -1;
+    }
     if (fseek(f, 0, SEEK_END) != 0) {
+        tp_io_err_set(ioe, reader, "seek", path, -1, 0, 0, errno);
         fclose(f);
         return -1;
     }
     sz = ftell(f);
     if (sz < 16) {
+        tp_io_err_set(ioe, reader, "too short", path, 0, 16, sz, 0);
         fclose(f);
         return -1;
     }
     rewind(f);
     buf = (unsigned char *)malloc((size_t)sz);
     if (!buf) {
+        tp_io_err_set(ioe, reader, "allocate", path, -1, sz, 0, ENOMEM);
         fclose(f);
         return -1;
     }
-    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+    errno = 0;
+    got = fread(buf, 1, (size_t)sz, f);
+    if (got != (size_t)sz) {
+        tp_io_err_set(ioe, reader, "read", path, (long long)got,
+                      sz, (long long)got, ferror(f) ? (errno ? errno : EIO) : 0);
         free(buf);
         fclose(f);
         return -1;
@@ -315,6 +336,7 @@ int tp_db_load_classic(struct tp_library *lib, const char *mount_root,
 {
     char *itunes, *cdb, *idb;
     const char *path = NULL;
+    const char *reader = "itunescdb";
     unsigned char *buf = NULL;
     size_t len = 0;
     struct parse_ctx ctx;
@@ -330,21 +352,43 @@ int tp_db_load_classic(struct tp_library *lib, const char *mount_root,
     } else if (idb && tp_is_readable_file(idb)) {
         path = idb;
         lib->format = TP_DB_FORMAT_ITUNESDB;
+        reader = "itunesdb";
     }
     if (!path) {
+        /*
+         * Neither database is there, or neither would read. Those are not
+         * the same thing - one means this is not that kind of volume, the
+         * other means the storage lost the file - and they arrived as the
+         * same -1.
+         */
+        int e = 0;
+        const char *tried = cdb ? cdb : idb;
+
+        if (tried && tp_file_read_check(tried, &e) == TP_FILE_UNREADABLE)
+            tp_io_err_set(&lib->io_err, reader, "read", tried, -1, 0, 0, e);
+        else
+            tp_io_err_set(&lib->io_err, reader, "not present", tried,
+                          -1, 0, 0, ENOENT);
         free(cdb);
         free(idb);
         return -1;
     }
 
-    if (load_file(path, &buf, &len) != 0) {
-        tp_error("Could not read database file:\n  %s", path);
+    if (load_file(path, &buf, &len, reader, &lib->io_err) != 0) {
+        char line[256];
+
+        if (tp_io_err_format(&lib->io_err, line, sizeof line) == 0)
+            tp_error("%s", line);
+        else
+            tp_error("Could not read database file:\n  %s", path);
         free(cdb);
         free(idb);
         return -1;
     }
     maybe_inflate(&buf, &len);
     if (len < 8 || memcmp(buf, "mhbd", 4) != 0) {
+        tp_io_err_set(&lib->io_err, reader, "no mhbd header", path,
+                      0, 8, (long long)len, 0);
         tp_error("Not a valid iTunesDB/CDB (missing mhbd):\n  %s", path);
         free(buf);
         free(cdb);
@@ -360,5 +404,13 @@ int tp_db_load_classic(struct tp_library *lib, const char *mount_root,
     free(buf);
     free(cdb);
     free(idb);
-    return lib->track_count > 0 ? 0 : -1;
+
+    /* Parsed, and empty. A different answer from "would not read", and the
+       two used to be the same -1. */
+    if (lib->track_count == 0) {
+        tp_io_err_set(&lib->io_err, reader, "no tracks in it", path,
+                      -1, 0, 0, 0);
+        return -1;
+    }
+    return 0;
 }

@@ -79,11 +79,34 @@ int tp_app_load(struct tp_app *app)
     tp_diag_stage("reading the database");
     rc = tp_db_load(&app->lib, app->vol.mount_root, app->vol.ipod_control_root,
                     TP_DB_FORMAT_UNKNOWN);
-    tp_diag_stage("database read");
+    {
+        /*
+         * Which reader, in the stage trail. That file is what is left after a
+         * crash or a kill, and "database read" alone does not say which of
+         * five readers was in the middle of it.
+         */
+        char stage[96];
+
+        snprintf(stage, sizeof stage, "database read (%s)",
+                 tp_db_format_name(app->lib.format));
+        tp_diag_stage(stage);
+    }
     if (rc != 0) {
         /* With no volume there is no path to name, and printing
            "(null)" reads like a bug in the loader rather than a disk
            that is not mounted. */
+        {
+            /*
+             * Say which reader failed and why, when it is known. This was one
+             * sentence naming a directory, for five readers and a dozen
+             * distinct faults - which is the absence of a diagnosis rather
+             * than a short one.
+             */
+            char line[256];
+
+            if (tp_io_err_format(&app->lib.io_err, line, sizeof line) == 0)
+                tp_error("%s", line);
+        }
         tp_error("Could not load the iPod music library under:\n  %s",
                  app->vol.ipod_control_root
                      ? app->vol.ipod_control_root
@@ -232,6 +255,9 @@ int tp_app_cmd_libcheck(struct tp_app *app, int json)
     printf("  playable: %zu\n", h->track_playable);
     printf("  missing files: %zu\n", h->missing_files);
     printf("  unsupported codec: %zu\n", h->unsupported_codec);
+    /* Separately from missing and from unsupported: a file that is
+       there and will not read is a storage problem, not a library one. */
+    printf("  unreadable files: %zu\n", h->unreadable_files);
     printf("  duplicate IDs: %zu\n\n", h->duplicate_ids);
     printf("Paths:\n");
     printf("  exact matches: %zu\n", h->path_exact);

@@ -18,6 +18,22 @@ char *tp_path_join3(const char *a, const char *b, const char *c);
 
 int tp_file_exists(const char *path);
 int tp_is_dir(const char *path);
+/*
+ * Whether a file exists, and separately whether its contents can be read.
+ *
+ * Those are not the same question on a device whose storage can lose track of
+ * blocks: a file can stat and open perfectly and then fail on the first read.
+ * Everything that used to ask "is this readable" was really asking the first
+ * question and getting a yes it had not earned.
+ */
+enum tp_file_state {
+    TP_FILE_OK = 0,
+    TP_FILE_MISSING,      /* no such file */
+    TP_FILE_UNREADABLE    /* it is there and the data would not come out */
+};
+
+enum tp_file_state tp_file_read_check(const char *path, int *out_errno);
+
 int tp_is_readable_file(const char *path);
 uint64_t tp_file_size(const char *path);
 

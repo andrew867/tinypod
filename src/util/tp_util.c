@@ -112,17 +112,67 @@ int tp_is_dir(const char *path)
     return path && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+/*
+ * Readable means a byte came out of it.
+ *
+ * This used to be stat, fopen, fclose - which asks whether the directory
+ * entry exists and whether the file can be opened, and never whether the data
+ * is there. On this device that is not a pedantic distinction: the flash
+ * translation layer returns EIO for blocks it has lost track of, so a file
+ * with no readable content passes stat and open perfectly and fails on the
+ * first read, somewhere much later, in a reader that reports a bare -1.
+ *
+ * Zero-length files are still readable - they are not damaged, just empty -
+ * so the read only has to succeed, not return anything.
+ */
 int tp_is_readable_file(const char *path)
 {
+    return tp_file_read_check(path, NULL) == TP_FILE_OK;
+}
+
+enum tp_file_state tp_file_read_check(const char *path, int *out_errno)
+{
     struct stat st;
+    unsigned char byte;
     FILE *f;
-    if (!path || stat(path, &st) != 0 || !S_ISREG(st.st_mode))
-        return 0;
+    size_t n;
+
+    if (out_errno)
+        *out_errno = 0;
+
+    if (!path)
+        return TP_FILE_MISSING;
+
+    errno = 0;
+    if (stat(path, &st) != 0) {
+        if (out_errno) *out_errno = errno;
+        return errno == EIO ? TP_FILE_UNREADABLE : TP_FILE_MISSING;
+    }
+    if (!S_ISREG(st.st_mode))
+        return TP_FILE_MISSING;
+
+    errno = 0;
     f = fopen(path, "rb");
-    if (!f)
-        return 0;
+    if (!f) {
+        if (out_errno) *out_errno = errno;
+        return errno == ENOENT ? TP_FILE_MISSING : TP_FILE_UNREADABLE;
+    }
+
+    if (st.st_size == 0) {
+        fclose(f);
+        return TP_FILE_OK;
+    }
+
+    errno = 0;
+    n = fread(&byte, 1, 1, f);
+    if (n != 1) {
+        int e = ferror(f) ? (errno ? errno : EIO) : 0;
+        fclose(f);
+        if (out_errno) *out_errno = e;
+        return TP_FILE_UNREADABLE;
+    }
     fclose(f);
-    return 1;
+    return TP_FILE_OK;
 }
 
 uint64_t tp_file_size(const char *path)
