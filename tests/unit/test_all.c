@@ -5,6 +5,7 @@
 #include "tp_file_probe.h"
 #include "tp_log.h"
 #include "tp_sink.h"
+#include "tp_browse.h"
 
 #include <assert.h>
 #include <math.h>
@@ -375,6 +376,140 @@ static void test_mount_bad_cli_falls_through(void)
     free(real); free(ic); free(it); free(mu); free(wrong);
 }
 
+
+/* An empty file, since what is being tested is the listing and not the
+   contents. */
+static void touch_in(const char *dir, const char *name)
+{
+    char *f = tp_path_join2(dir, name);
+    FILE *h;
+
+    if (!f)
+        return;
+    h = fopen(f, "w");
+    if (h)
+        fclose(h);
+    free(f);
+}
+
+/*
+ * The folder browser's listing rules.
+ *
+ * What it shows and in what order is the whole of it: a browser that hides a
+ * folder, offers a file it cannot play, or lists in readdir order is worse
+ * than not having one. None of that is visible from a screenshot of a
+ * directory that happens to be sorted already.
+ */
+static void test_browse_listing(void)
+{
+    char root[] = "/tmp/tp_browse_XXXXXX";
+    char *sub, *dot;
+    struct tp_browse b;
+    char err[96];
+    size_t i;
+    int seen_dir = 0, seen_mp3 = 0, seen_txt = 0, seen_hidden = 0;
+
+    if (!mkdtemp(root)) { EXPECT(0); return; }
+
+    /* Names chosen so readdir order and sorted order cannot coincide. */
+    sub = tp_path_join2(root, "zzz folder");
+    mkdir(sub, 0755);
+    dot = tp_path_join2(root, ".hidden");
+    mkdir(dot, 0755);
+    touch_in(root, "beta.mp3");
+    touch_in(root, "alpha.MP3");
+    touch_in(root, "notes.txt");
+
+    EXPECT(tp_browse_open(&b, root, 0, err, sizeof err) == 0);
+
+    for (i = 0; i < b.count; i++) {
+        if (b.entries[i].is_dir && !strcmp(b.entries[i].name, "zzz folder"))
+            seen_dir = 1;
+        if (!strcmp(b.entries[i].name, "beta.mp3"))
+            seen_mp3 = 1;
+        if (!strcmp(b.entries[i].name, "notes.txt"))
+            seen_txt = 1;
+        if (!strcmp(b.entries[i].name, ".hidden"))
+            seen_hidden = 1;
+    }
+
+    EXPECT(seen_dir);          /* folders are always listed */
+    EXPECT(seen_mp3);          /* a playable file is listed */
+    EXPECT(!seen_txt);         /* one we cannot decode is not */
+    EXPECT(!seen_hidden);      /* nor is a dot entry, by default */
+
+    /* Folders first, whatever their names sort like: "zzz folder" has to
+       come before "alpha.MP3" or the ordering is alphabetical rather than
+       folders-then-files. */
+    EXPECT(b.count == 3);
+    if (b.count == 3) {
+        EXPECT(b.entries[0].is_dir);
+        EXPECT(!b.entries[1].is_dir);
+        /* Case-insensitive: alpha.MP3 before beta.mp3, not after. */
+        EXPECT(strcmp(b.entries[1].name, "alpha.MP3") == 0);
+        EXPECT(strcmp(b.entries[2].name, "beta.mp3") == 0);
+    }
+    tp_browse_free(&b);
+
+    /* Asked for them, the dot entries appear. */
+    EXPECT(tp_browse_open(&b, root, 1, err, sizeof err) == 0);
+    seen_hidden = 0;
+    for (i = 0; i < b.count; i++)
+        if (!strcmp(b.entries[i].name, ".hidden"))
+            seen_hidden = 1;
+    EXPECT(seen_hidden);
+    tp_browse_free(&b);
+
+    /* A directory that is not there is a message, not a crash. */
+    {
+        char *gone = tp_path_join2(root, "nope");
+        err[0] = 0;
+        EXPECT(tp_browse_open(&b, gone, 0, err, sizeof err) == -1);
+        EXPECT(err[0] != 0);
+        tp_browse_free(&b);
+        free(gone);
+    }
+
+    free(sub);
+    free(dot);
+}
+
+/* Joining and walking back up, including the ends people forget. */
+static void test_browse_paths(void)
+{
+    char out[TP_BROWSE_PATH_MAX];
+
+    EXPECT(tp_browse_join(out, sizeof out, "/mnt/disk", "Music") == 0);
+    EXPECT(strcmp(out, "/mnt/disk/Music") == 0);
+
+    /* A trailing slash must not double up. */
+    EXPECT(tp_browse_join(out, sizeof out, "/mnt/disk/", "Music") == 0);
+    EXPECT(strcmp(out, "/mnt/disk/Music") == 0);
+
+    /* The root joins to /thing, not //thing. */
+    EXPECT(tp_browse_join(out, sizeof out, "/", "mnt") == 0);
+    EXPECT(strcmp(out, "/mnt") == 0);
+
+    /* Too long to fit is refused rather than truncated into a wrong path. */
+    {
+        char big[TP_BROWSE_PATH_MAX + 8];
+        memset(big, 'a', sizeof big - 1);
+        big[sizeof big - 1] = 0;
+        EXPECT(tp_browse_join(out, sizeof out, "/mnt", big) == -1);
+    }
+
+    EXPECT(tp_browse_parent(out, sizeof out, "/mnt/disk/Music") == 0);
+    EXPECT(strcmp(out, "/mnt/disk") == 0);
+
+    /* One below the root goes to the root, not to an empty string. */
+    EXPECT(tp_browse_parent(out, sizeof out, "/mnt") == 0);
+    EXPECT(strcmp(out, "/") == 0);
+
+    /* The root has no parent, which is what stops a drill-down walking off
+       the top of the disk. */
+    EXPECT(tp_browse_parent(out, sizeof out, "/") == -1);
+}
+
 int main(void)
 {
     tp_log_set_level(TP_LOG_ERROR);
@@ -388,6 +523,8 @@ int main(void)
     test_volume_detect_no_mount();
     test_volume_ipod_control();
     test_missing_music();
+    test_browse_listing();
+    test_browse_paths();
     test_mount_bad_cli_falls_through();
     test_sink_resample();
     if (g_fail) {

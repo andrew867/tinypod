@@ -261,9 +261,13 @@ static void draw_term(struct ui_state *ui)
         printf("  %s Artists\n", ui->sel == 2 ? ">" : " ");
         printf("  %s Albums\n", ui->sel == 3 ? ">" : " ");
         printf("  %s Playlists\n", ui->sel == 4 ? ">" : " ");
-        printf("  %s Now Playing\n", ui->sel == 5 ? ">" : " ");
-        printf("  %s Settings\n", ui->sel == 6 ? ">" : " ");
-        printf("  %s About\n", ui->sel == 7 ? ">" : " ");
+        /* Folders is graphical-only: a drill-down browser over ssh is
+           what the shell you are already in does better. The row is
+           listed so the two menus agree and nothing is off by one. */
+        printf("  %s Folders (graphical UI only)\n", ui->sel == 5 ? ">" : " ");
+        printf("  %s Now Playing\n", ui->sel == 6 ? ">" : " ");
+        printf("  %s Settings\n", ui->sel == 7 ? ">" : " ");
+        printf("  %s About\n", ui->sel == 8 ? ">" : " ");
         printf("\nj/k move  Enter select  p pause  n next  b prev  x stop  q back\n");
         break;
     case UI_SONGS:
@@ -349,9 +353,10 @@ static void activate(struct ui_state *ui)
         case 2: ui->screen = UI_ARTISTS; ui->sel = 0; break;
         case 3: ui->screen = UI_ALBUMS; ui->sel = 0; break;
         case 4: ui->screen = UI_PLAYLISTS; ui->sel = 0; break;
-        case 5: ui->screen = UI_NOW; break;
-        case 6: ui->screen = UI_SETTINGS; break;
-        case 7: ui->screen = UI_ABOUT; break;
+        case 5: break;                 /* Folders: graphical UI only */
+        case 6: ui->screen = UI_NOW; break;
+        case 7: ui->screen = UI_SETTINGS; break;
+        case 8: ui->screen = UI_ABOUT; break;
         }
     } else if (ui->screen == UI_SONGS && ui->app->lib.track_count) {
         size_t idx = (size_t)ui->sel;

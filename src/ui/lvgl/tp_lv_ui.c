@@ -17,6 +17,7 @@
 #include "tp_lv_input.h"
 
 #include "tp_app.h"
+#include "tp_browse.h"
 #include "util/tp_build.h"
 #include "tp_log.h"
 
@@ -53,6 +54,7 @@ enum view_kind {
     V_ARTIST_ALBUMS, /* the albums by one artist */
     V_LETTERS,       /* initials, to jump into a long list with */
     V_TRACKS,        /* the tracks under an artist, album or playlist */
+    V_FILES,
     V_NOW,
     V_SETTINGS,
     V_ABOUT
@@ -105,6 +107,19 @@ struct ui {
     enum view_kind letter_src;
 
     char title_buf[96];
+
+    /*
+     * The folder browser. One directory in hand at a time - a drill-down
+     * only ever shows the level it is on, and a read-only vfat mount on NAND
+     * is not somewhere to go walking recursively.
+     *
+     * The path is per level so that going back returns to where you were
+     * rather than to the root.
+     */
+    struct tp_browse browse;
+    char             browse_path[TP_BROWSE_PATH_MAX];
+    char             browse_err[96];
+    int              show_hidden;
 };
 
 static struct ui s_ui;
@@ -125,6 +140,7 @@ static const struct {
     { "Artists",     NULL },
     { "Albums",      NULL },
     { "Playlists",   NULL },
+    { "Folders",     NULL },
     { "Now Playing", NULL },
     { "Settings",    NULL },
     { "About",       NULL },
@@ -204,6 +220,48 @@ static void fill_menu(int i, struct tp_lv_row *out, void *ctx)
     case 4: snprintf(sub[4], sizeof sub[4], "%zu", app->lib.playlist_count);
             out->line2 = sub[4]; break;
     default: break;
+    }
+}
+
+/* ---- the folder browser --------------------------------------------------- */
+
+/*
+ * Read s_ui.browse_path into the list.
+ *
+ * Failure is not a dead end: the path stays, the list comes back empty, and
+ * the reason goes on screen where the rows would have been. A folder that
+ * cannot be read is a thing to be told about, not a reason to bounce back to
+ * the menu with nothing said.
+ */
+static void browse_load(void)
+{
+    tp_browse_free(&s_ui.browse);
+    s_ui.browse_err[0] = 0;
+    tp_browse_open(&s_ui.browse, s_ui.browse_path, s_ui.show_hidden,
+                   s_ui.browse_err, sizeof s_ui.browse_err);
+}
+
+static void fill_files(int i, struct tp_lv_row *out, void *ctx)
+{
+    struct tp_app *app = ctx;
+    const struct tp_browse_entry *e;
+    static char sub[8][40];
+
+    (void)app;
+    if (i < 0 || (size_t)i >= s_ui.browse.count)
+        return;
+
+    e = &s_ui.browse.entries[i];
+    out->line1 = e->name;
+
+    /*
+     * A folder says so and a track does not. Without the marker the only way
+     * to tell what a row will do is to press it, and on a volume where
+     * albums are folders and tracks are files that is most of the screen.
+     */
+    if (e->is_dir) {
+        snprintf(sub[i % 8], sizeof sub[0], "folder");
+        out->line2 = sub[i % 8];
     }
 }
 
@@ -440,6 +498,11 @@ static void fill_settings(int i, struct tp_lv_row *out, void *ctx)
         snprintf(v[2], sizeof v[2], "%zu tracks", app->lib.track_count);
         out->line2 = v[2];
         break;
+    case 3:
+        out->line1 = "Show hidden files";
+        snprintf(v[3], sizeof v[3], "%s", s_ui.show_hidden ? "On" : "Off");
+        out->line2 = v[3];
+        break;
     default:
         out->line1 = "Stop playback";
         out->line2 = NULL;
@@ -447,7 +510,7 @@ static void fill_settings(int i, struct tp_lv_row *out, void *ctx)
     }
 }
 
-#define SETTINGS_N 4
+#define SETTINGS_N 5
 
 /* ---- building a drill-down ------------------------------------------------ */
 
@@ -599,6 +662,19 @@ static void push(enum view_kind kind, int filter, const char *title)
 
 static void pop(void)
 {
+    /*
+     * Leaving a folder means going up one, not back to where the browser
+     * started. The stack carries the depth; the path has to be walked back
+     * by hand because it is one string rather than one per level.
+     */
+    if (s_ui.depth > 0 && top_view()->kind == V_FILES) {
+        char up[TP_BROWSE_PATH_MAX];
+        if (tp_browse_parent(up, sizeof up, s_ui.browse_path) == 0) {
+            snprintf(s_ui.browse_path, sizeof s_ui.browse_path, "%s", up);
+            browse_load();
+        }
+    }
+
     if (s_ui.depth > 0)
         s_ui.depth--;
     /* Each list belongs to the view that was popped. */
@@ -621,6 +697,7 @@ static int view_count(struct view *v)
     case V_PLAYLISTS: return (int)app->lib.playlist_count;
     case V_ARTIST_ALBUMS: return (int)s_ui.falbums_n;
     case V_TRACKS:    return (int)s_ui.filtered_n;
+    case V_FILES:     return (int)s_ui.browse.count;
     case V_SETTINGS:  return SETTINGS_N;
     default:          return 0;
     }
@@ -669,8 +746,16 @@ static void activate(void)
         case 2: push(V_ARTISTS, 0, NULL); break;
         case 3: push(V_ALBUMS, 0, NULL); break;
         case 4: push(V_PLAYLISTS, 0, NULL); break;
-        case 5: push(V_NOW, 0, NULL); break;
-        case 6: push(V_SETTINGS, 0, NULL); break;
+        case 5:
+            /* Wherever the volume turned out to be, not a fixed path: the
+               mount is detected and can be somewhere other than /mnt/disk. */
+            snprintf(s_ui.browse_path, sizeof s_ui.browse_path, "%s",
+                     app->vol.mount_root ? app->vol.mount_root : "/mnt/disk");
+            browse_load();
+            push(V_FILES, 0, NULL);
+            break;
+        case 6: push(V_NOW, 0, NULL); break;
+        case 7: push(V_SETTINGS, 0, NULL); break;
         default: push(V_ABOUT, 0, NULL); break;
         }
         break;
@@ -745,6 +830,37 @@ static void activate(void)
             play_index(s_ui.filtered[v->sel]);
         break;
 
+    case V_FILES: {
+        const struct tp_browse_entry *e;
+        char next[TP_BROWSE_PATH_MAX];
+
+        if (v->sel < 0 || (size_t)v->sel >= s_ui.browse.count)
+            break;
+        e = &s_ui.browse.entries[v->sel];
+
+        if (tp_browse_join(next, sizeof next, s_ui.browse_path, e->name) != 0)
+            break;
+
+        if (e->is_dir) {
+            snprintf(s_ui.browse_path, sizeof s_ui.browse_path, "%s", next);
+            browse_load();
+            push(V_FILES, 0, NULL);
+            break;
+        }
+
+        /*
+         * Straight to the file, with no library lookup: this is the whole
+         * point of the browser, and the thing being played may well not be
+         * in the database at all.
+         */
+        push(V_NOW, 0, NULL);
+        draw();
+        lv_refr_now(NULL);
+        if (tp_app_cmd_play_file(app, next) == 0)
+            s_ui.was_playing = 1;
+        break;
+    }
+
     case V_NOW:
         if (tp_player_state(app->player) == TP_PLAYER_PLAYING) {
             tp_app_cmd_pause(app);
@@ -759,6 +875,12 @@ static void activate(void)
     case V_SETTINGS:
         if (v->sel == 0) {
             app->cfg.shuffle = !app->cfg.shuffle;
+        } else if (v->sel == 3) {
+            /* Re-read the folder in hand, so the switch takes effect where
+               you can see it rather than the next time you open one. */
+            s_ui.show_hidden = !s_ui.show_hidden;
+            if (s_ui.browse_path[0])
+                browse_load();
         } else if (v->sel == SETTINGS_N - 1) {
             tp_app_cmd_stop(app);
             s_ui.was_playing = 0;
@@ -841,6 +963,23 @@ static void draw(void)
                         app, "No tracks here");
         tp_lv_set_hint("PLAY play   hold PLAY back");
         break;
+
+    case V_FILES: {
+        /*
+         * The last component of the path, not the whole thing: a header is
+         * forty pixels of a 240-wide panel and "/mnt/disk/Music/Some Artist"
+         * would be an ellipsis with a slash in it. The folder you are in is
+         * the part you need.
+         */
+        const char *slash = strrchr(s_ui.browse_path, '/');
+        const char *leaf = slash && slash[1] ? slash + 1 : s_ui.browse_path;
+
+        tp_lv_show_list(leaf, count, v->sel, v->top, fill_files, app,
+                        s_ui.browse_err[0] ? s_ui.browse_err
+                                           : "Nothing here to play");
+        tp_lv_set_hint("PLAY open   hold PLAY back");
+        break;
+    }
 
     case V_SETTINGS:
         tp_lv_show_list("Settings", count, v->sel, v->top, fill_settings, app,
@@ -1060,8 +1199,9 @@ int tp_lv_ui_shots(struct tp_app *app, const char *dir)
      * A walk through the parts worth looking at, by pressing the buttons a
      * person would press.
      *
-     * The home menu is Shuffle All, Songs, Artists, Albums, Playlists, Now
-     * Playing, Settings, About - so a name here is the screen the keys
+     * The home menu is Shuffle All, Songs, Artists, Albums, Playlists,
+     * Folders, Now Playing, Settings, About - so a name here is the screen
+     * the keys
      * actually land on, and the two have to be kept in step. They were not:
      * "songs" was one 'd' short and showed Artists, and every later name was
      * off by the same step. A screenshot that lies about which screen it is
@@ -1079,8 +1219,14 @@ int tp_lv_ui_shots(struct tp_app *app, const char *dir)
         { "artists-jumped", "ddssdddds"           },  /* pick a letter */
         { "albums",         "ddds"                },
         { "album-tracks",   "dddsdddddddddddddds" },
-        { "settings",       "dddddds"             },
-        { "about",          "ddddddds"            },
+        { "folders",        "ddddds"              },
+        /* Into iPod_Control, along to Music, into the first folder:
+           a drill-down three deep, ending on a list of files rather
+           than folders. Stops short of pressing one, which would
+           play it. */
+        { "folders-files",  "dddddssdss"          },
+        { "settings",       "ddddddds"            },
+        { "about",          "dddddddds"           },
         { "now-playing",    "s"                   },  /* Shuffle All */
     };
 
