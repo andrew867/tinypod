@@ -16,6 +16,8 @@
 #include "tp_lv_screens.h"
 #include "tp_lv_input.h"
 #include "tp_volume.h"
+#include "backlight.h"
+#include "status.h"
 
 #include "tp_app.h"
 #include "tp_browse.h"
@@ -80,6 +82,42 @@ struct view {
  */
 #define VOLUME_STEP 5
 
+/*
+ * Holding a volume key to run down a long list.
+ *
+ * The kernel repeats at about thirty a second, so a five hundred track list
+ * was a fifteen second hold at one row a time. Rows per press step up the
+ * longer the key is held, which is the difference between a list you scroll
+ * and a list you give up on.
+ *
+ * A gap longer than RUN_GAP_MS ends the run, so tapping stays one row a tap
+ * however fast the tapping is - the acceleration must never make a single
+ * press overshoot.
+ */
+/*
+ * How long the panel stays lit with nobody pressing anything.
+ *
+ * There was no blanking at all: the screen stayed lit for as long as the app
+ * ran, which on a music player is the whole album. The panel is the largest
+ * draw on the device by a wide margin, and music does not need to be looked
+ * at - so it goes off and any button brings it back.
+ *
+ * The first press after blanking only wakes. Waking and acting on the same
+ * press means a button found in a pocket starts playing something.
+ */
+#define BLANK_MS 20000
+
+/* How often the status bar re-reads the battery. It is a median over a window
+   of voltage readings and moves slowly; polling it every frame would cost more
+   than it tells anyone. */
+#define STATUS_MS 5000
+
+#define RUN_GAP_MS  200
+#define RUN_FAST    8      /* presses before it speeds up */
+#define RUN_FASTER  20     /* and before it really does */
+#define STEP_FAST   4
+#define STEP_FASTER 12
+
 struct ui {
     struct tp_app *app;
     struct view stack[MAX_DEPTH];
@@ -135,6 +173,15 @@ struct ui {
      * to the volume until you hold PLAY to give them back. The hint bar says
      * so while it is happening, because nothing else on screen would.
      */
+    /* How long a volume key has been held, for the acceleration above. */
+    int           scroll_run;
+    int           scroll_dir;
+    unsigned long scroll_last;
+
+    /* Panel state, and when the last press was. */
+    int           blanked;
+    unsigned long last_input;
+
     int adjusting;           /* which settings row, or -1 */
     int volume;              /* last read, so the row can draw without a
                                 mixer call on every frame */
@@ -305,13 +352,59 @@ static void browse_load(void)
                    s_ui.browse_err, sizeof s_ui.browse_err);
 }
 
+/* Declared here because the browser's row filler sits above them and needs
+   both: the jump row is drawn by one and measured by the other. */
+static int jump_offset(enum view_kind kind);
+static int fill_jump(int i, struct tp_lv_row *out, enum view_kind kind);
+
+/*
+ * Whether this folder offers a "Play all" row, and how many tracks it has.
+ *
+ * Only where there is something to play: an empty folder, or one holding
+ * nothing but more folders, would otherwise offer a row that does nothing.
+ */
+static int browse_playable(void)
+{
+    size_t i;
+    int n = 0;
+
+    for (i = 0; i < s_ui.browse.count; i++)
+        if (!s_ui.browse.entries[i].is_dir && s_ui.browse.entries[i].playable)
+            n++;
+    return n;
+}
+
+static int browse_offset(void)
+{
+    return browse_playable() > 0 ? 1 : 0;
+}
+
 static void fill_files(int i, struct tp_lv_row *out, void *ctx)
 {
     struct tp_app *app = ctx;
     const struct tp_browse_entry *e;
     static char sub[8][40];
+    static char head[40];
 
     (void)app;
+
+    if (browse_offset()) {
+        if (i == 0) {
+            int n = browse_playable();
+
+            out->line1 = "Play all";
+            snprintf(head, sizeof head, "%d track%s in this folder",
+                     n, n == 1 ? "" : "s");
+            out->line2 = head;
+            return;
+        }
+        i--;
+    }
+
+    if (fill_jump(i, out, V_FILES))
+        return;
+    i -= jump_offset(V_FILES);
+
     if (i < 0 || (size_t)i >= s_ui.browse.count)
         return;
 
@@ -351,6 +444,8 @@ static int raw_count(enum view_kind kind)
     case V_SONGS:   return (int)app->lib.track_count;
     case V_ARTISTS: return (int)app->lib.artist_count;
     case V_ALBUMS:  return (int)app->lib.album_count;
+    case V_TRACKS:  return (int)s_ui.filtered_n;
+    case V_FILES:   return (int)s_ui.browse.count;
     default:        return 0;
     }
 }
@@ -366,6 +461,12 @@ static const char *row_name(enum view_kind kind, int i)
     case V_SONGS:   return app->lib.tracks[i].artist;
     case V_ARTISTS: return app->lib.artists[i].name;
     case V_ALBUMS:  return app->lib.albums[i].album;
+    /* By title here, unlike Songs: a track list is already one artist and one
+       album, so the only thing that distinguishes its rows is the title. */
+    case V_TRACKS:  return ((size_t)i < s_ui.filtered_n)
+                        ? app->lib.tracks[s_ui.filtered[i]].title : NULL;
+    case V_FILES:   return ((size_t)i < s_ui.browse.count)
+                        ? s_ui.browse.entries[i].name : NULL;
     default:        return NULL;
     }
 }
@@ -377,10 +478,30 @@ static int jump_offset(enum view_kind kind)
     case V_SONGS:
     case V_ARTISTS:
     case V_ALBUMS:
+    case V_TRACKS:
+    case V_FILES:
         return raw_count(kind) >= JUMP_MIN ? 1 : 0;
     default:
         return 0;
     }
+}
+
+/*
+ * How many rows sit above the real list on this screen.
+ *
+ * The browser has two of them - Play all, then Jump to - and everywhere else
+ * has at most the jump. Everything that turns a selection into an index goes
+ * through here.
+ */
+static int browse_offset(void);
+
+static int head_rows(enum view_kind kind)
+{
+    int n = jump_offset(kind);
+
+    if (kind == V_FILES)
+        n += browse_offset();
+    return n;
 }
 
 /* Collect the initials present and where each one starts. The lists are
@@ -508,7 +629,15 @@ static void fill_playlists(int i, struct tp_lv_row *out, void *ctx)
 static void fill_tracks(int i, struct tp_lv_row *out, void *ctx)
 {
     struct tp_app *app = ctx;
-    struct tp_track *t = &app->lib.tracks[s_ui.filtered[i]];
+    struct tp_track *t;
+
+    if (fill_jump(i, out, V_TRACKS))
+        return;
+    i -= jump_offset(V_TRACKS);
+    if (i < 0 || (size_t)i >= s_ui.filtered_n)
+        return;
+
+    t = &app->lib.tracks[s_ui.filtered[i]];
     static char badge[8][12];
     int slot = i % 8;
 
@@ -786,8 +915,8 @@ static int view_count(struct view *v)
     case V_LETTERS:   return s_ui.letters_n;
     case V_PLAYLISTS: return (int)app->lib.playlist_count;
     case V_ARTIST_ALBUMS: return (int)s_ui.falbums_n;
-    case V_TRACKS:    return (int)s_ui.filtered_n;
-    case V_FILES:     return (int)s_ui.browse.count;
+    case V_TRACKS:    return (int)s_ui.filtered_n + jump_offset(V_TRACKS);
+    case V_FILES:     return (int)s_ui.browse.count + head_rows(V_FILES);
     case V_SETTINGS:  return SETTINGS_N;
     default:          return 0;
     }
@@ -865,7 +994,7 @@ static void activate(void)
         int at = (v->sel >= 0 && v->sel < s_ui.letters_n)
                      ? s_ui.letter_row[v->sel] : 0;
         pop();
-        top_view()->sel = at + jump_offset(s_ui.letter_src);
+        top_view()->sel = at + head_rows(s_ui.letter_src);
         break;
     }
 
@@ -915,7 +1044,16 @@ static void activate(void)
         push(V_TRACKS, v->sel, app->lib.playlists[v->sel].name);
         break;
 
-    case V_TRACKS:
+    case V_TRACKS: {
+        int sel;
+
+        if (jump_offset(V_TRACKS) && v->sel == 0) {
+            build_letters(V_TRACKS);
+            push(V_LETTERS, 0, v->title);
+            break;
+        }
+        sel = v->sel - jump_offset(V_TRACKS);
+
         /*
          * The album is the queue, not the whole library.
          *
@@ -923,10 +1061,10 @@ static void activate(void)
          * on through a shuffle of everything, because the queue was rebuilt
          * from the library on the way. The list on screen is the queue.
          */
-        if ((size_t)v->sel < s_ui.filtered_n) {
+        if (sel >= 0 && (size_t)sel < s_ui.filtered_n) {
             app->queue.repeat = repeat_from_cfg(app);
             if (tp_queue_from_indices(&app->queue, &app->lib, s_ui.filtered,
-                                      s_ui.filtered_n, s_ui.filtered[v->sel],
+                                      s_ui.filtered_n, s_ui.filtered[sel],
                                       app->cfg.shuffle) == 0) {
                 push(V_NOW, 0, NULL);
                 draw();
@@ -934,18 +1072,44 @@ static void activate(void)
                 if (tp_app_play_current(app) == 0)
                     s_ui.was_playing = 1;
             } else {
-                play_index(s_ui.filtered[v->sel]);
+                play_index(s_ui.filtered[sel]);
             }
         }
         break;
+    }
 
     case V_FILES: {
         const struct tp_browse_entry *e;
         char next[TP_BROWSE_PATH_MAX];
+        int sel = v->sel;
 
-        if (v->sel < 0 || (size_t)v->sel >= s_ui.browse.count)
+        /* Play all: the folder from the top, in the order it is listed. */
+        if (browse_offset()) {
+            if (sel == 0) {
+                push(V_NOW, 0, NULL);
+                draw();
+                lv_refr_now(NULL);
+                app->queue.repeat = repeat_from_cfg(app);
+                if (tp_queue_from_folder(&app->queue, &app->lib,
+                                         s_ui.browse_path, NULL,
+                                         app->cfg.shuffle) == 0 &&
+                    tp_app_play_current(app) == 0)
+                    s_ui.was_playing = 1;
+                break;
+            }
+            sel--;
+        }
+
+        if (jump_offset(V_FILES) && sel == 0) {
+            build_letters(V_FILES);
+            push(V_LETTERS, 0, "Files");
             break;
-        e = &s_ui.browse.entries[v->sel];
+        }
+        sel -= jump_offset(V_FILES);
+
+        if (sel < 0 || (size_t)sel >= s_ui.browse.count)
+            break;
+        e = &s_ui.browse.entries[sel];
 
         if (tp_browse_join(next, sizeof next, s_ui.browse_path, e->name) != 0)
             break;
@@ -1162,6 +1326,8 @@ static void draw(void)
 
         n.codec = tp_player_codec(app->player);
         n.shuffle = app->cfg.shuffle ? true : false;
+        n.repeat = (repeat_from_cfg(app) == TP_REPEAT_OFF) ? ""
+                                                          : repeat_label(app);
 
         switch (tp_player_state(app->player)) {
         case TP_PLAYER_PLAYING: n.state = 1; break;
@@ -1201,6 +1367,29 @@ static void draw(void)
 }
 
 /* ---- keys ----------------------------------------------------------------- */
+
+/*
+ * How many rows this press moves, given how long the key has been held.
+ *
+ * Called once per press, and it is what counts the run - so it has to be
+ * called for every up or down, not only when the selection can actually move.
+ */
+static int scroll_step(int dir)
+{
+    unsigned long now = now_ms();
+
+    if (dir != s_ui.scroll_dir || now - s_ui.scroll_last > RUN_GAP_MS)
+        s_ui.scroll_run = 0;
+    else
+        s_ui.scroll_run++;
+
+    s_ui.scroll_dir = dir;
+    s_ui.scroll_last = now;
+
+    if (s_ui.scroll_run >= RUN_FASTER) return STEP_FASTER;
+    if (s_ui.scroll_run >= RUN_FAST)   return STEP_FAST;
+    return 1;
+}
 
 static void on_key(enum tp_lv_key k)
 {
@@ -1248,11 +1437,22 @@ static void on_key(enum tp_lv_key k)
 
     switch (k) {
     case TP_LV_UP:
-        if (v->sel > 0) v->sel--;
+    case TP_LV_DOWN: {
+        int dir = (k == TP_LV_UP) ? -1 : 1;
+        int step = scroll_step(dir);
+        int last = view_count(v) - 1;
+
+        v->sel += dir * step;
+
+        /*
+         * Stop at the ends rather than wrapping. A list that wraps under an
+         * accelerated hold shoots past the end and comes back round, and the
+         * thumb has no way to predict where it stops.
+         */
+        if (v->sel < 0) v->sel = 0;
+        if (v->sel > last) v->sel = last < 0 ? 0 : last;
         break;
-    case TP_LV_DOWN:
-        if (v->sel < view_count(v) - 1) v->sel++;
-        break;
+    }
     case TP_LV_SELECT:
         activate();
         break;
@@ -1583,6 +1783,10 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
         lv_timer_handler();
         usleep(FRAME_MS * 1000u);
     }
+
+    /* Never leave the panel dark for the launcher to inherit. */
+    if (s_ui.blanked)
+        n31_backlight_on();
 
     filtered_free();
     tp_lv_input_close();

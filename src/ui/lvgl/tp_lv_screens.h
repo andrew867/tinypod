@@ -39,6 +39,9 @@ struct tp_lv_now {
     int  state;            /* 0 stopped, 1 playing, 2 paused */
     int  index, total;     /* position in the queue, 1-based; 0 total hides it */
     bool shuffle;
+    /* "", "All" or "One". Setting repeat and getting no acknowledgement on
+       the one screen that plays music made it feel like it had not taken. */
+    const char *repeat;
     const char *error;     /* shown instead of the transport when set */
 };
 
@@ -55,6 +58,21 @@ void tp_lv_show_list(const char *title, int count, int sel, int top,
 
 /* How many rows a list shows at once, which the caller needs for scrolling. */
 int tp_lv_list_rows(void);
+
+/*
+ * The status line: battery, whether there is a cable, and the clock.
+ *
+ * Nothing in this app showed either. The launcher has them, so the moment you
+ * opened TinyPod you were blind to both - which matters most in the app you
+ * leave running for hours.
+ *
+ * pct below zero means no battery was found. clock_valid is false when the
+ * clock has never been set, and then hours/minutes are an uptime instead -
+ * this device has no RTC that survives a power cycle, and a status bar
+ * confidently showing 00:38 is worse than showing nothing.
+ */
+void tp_lv_set_status(int pct, bool plugged, bool clock_valid,
+                      int hours, int minutes);
 
 void tp_lv_show_now(const struct tp_lv_now *n);
 void tp_lv_show_message(const char *title, const char *body);

@@ -148,6 +148,7 @@ static lv_obj_t *s_screen;
 static lv_obj_t *s_title;
 static lv_obj_t *s_count;
 static lv_obj_t *s_hint;
+static lv_obj_t *s_status;
 static lv_obj_t *s_hold;
 
 /* the list */
@@ -315,6 +316,17 @@ void tp_lv_screens_init(void)
        reading "hold PLAY" with the "back" cut off. */
     s_hint = centred(s_screen, "", F_CAPTION, C_TEXT_MUTE, FOOTER_Y - 14, 32);
 
+    /*
+     * Below the hint rather than beside the title: the top right already
+     * carries the count, and on a 240 pixel panel the two would be fighting
+     * over about forty pixels. Down here it is out of the way of every screen
+     * and still on all of them.
+     */
+    s_status = label(s_screen, "", F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_size(s_status, CONTENT_W, 16);
+    lv_obj_set_style_text_align(s_status, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(s_status, MARGIN, FOOTER_Y + 4);
+
     /* Fills across the bottom while PLAY is held, so a long press shows it is
        being counted rather than ignored. */
     s_hold = panel(s_screen, 0, TP_LV_H - 2, TP_LV_W, 2, C_ACCENT);
@@ -326,6 +338,31 @@ void tp_lv_screens_init(void)
 void tp_lv_set_hint(const char *hint)
 {
     lv_label_set_text(s_hint, hint ? hint : "");
+}
+
+void tp_lv_set_status(int pct, bool plugged, bool clock_valid,
+                      int hours, int minutes)
+{
+    char t[48];
+    int n = 0;
+
+    t[0] = 0;
+
+    if (pct >= 0)
+        n += snprintf(t + n, sizeof t - (size_t)n, "%s%d%%",
+                      plugged ? LV_SYMBOL_CHARGE " " : "", pct);
+    else if (plugged)
+        n += snprintf(t + n, sizeof t - (size_t)n, LV_SYMBOL_CHARGE);
+
+    /* "up 3:20" rather than a time of day, when the clock was never set. */
+    if (clock_valid)
+        snprintf(t + n, sizeof t - (size_t)n, "%s%02d:%02d",
+                 n ? "   " : "", hours, minutes);
+    else
+        snprintf(t + n, sizeof t - (size_t)n, "%sup %d:%02d",
+                 n ? "   " : "", hours, minutes);
+
+    lv_label_set_text(s_status, t);
 }
 
 void tp_lv_set_holding(bool on)
@@ -503,11 +540,26 @@ void tp_lv_show_now(const struct tp_lv_now *n)
         break;
     }
 
-    t[0] = 0;
-    if (n->shuffle)
-        snprintf(t, sizeof t, "%s  shuffle", n->codec ? n->codec : "");
-    else if (n->codec)
-        snprintf(t, sizeof t, "%s", n->codec);
+    /*
+     * Codec, then whichever of shuffle and repeat are on.
+     *
+     * Built up rather than enumerated, because there are four combinations of
+     * two settings and writing all four out is how one of them ends up
+     * missing a space.
+     */
+    {
+        int k = 0;
+
+        t[0] = 0;
+        if (n->codec && n->codec[0])
+            k += snprintf(t + k, sizeof t - (size_t)k, "%s", n->codec);
+        if (n->shuffle)
+            k += snprintf(t + k, sizeof t - (size_t)k, "%sshuffle",
+                          k ? "  " : "");
+        if (n->repeat && n->repeat[0])
+            snprintf(t + k, sizeof t - (size_t)k, "%srepeat %s",
+                     k ? "  " : "", n->repeat);
+    }
     lv_label_set_text(s_now_extra, t);
 }
 

@@ -90,10 +90,26 @@ CDEFS := -D_GNU_SOURCE -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 \
 ifeq ($(UI_LVGL),1)
   LVGL ?= ../../NanoApps/lvgl
   LVGL_LIB ?= src/ui/lvgl/build-$(TARGET)/liblvgl.a
+
+  #
+  # The launcher's backlight and status code, compiled in rather than copied.
+  #
+  # Both are self-contained - libc and their own header - and both know things
+  # that are expensive to get right twice: which of bl_power and brightness
+  # this panel actually honours, and a battery curve anchored to a voltage
+  # measured on this device. A second copy of that curve would drift the first
+  # time either was touched. TinyGB compiles the same tree's fbcon.c already.
+  #
+  N31LAUNCHER ?= ../../NanoApps/apps/n31launcher
   SRC_APP += src/ui/lvgl/tp_lv_ui.c src/ui/lvgl/tp_lv_screens.c \
 	src/ui/lvgl/tp_lv_input.c
+  # Kept out of SRC_APP: that list is turned into objects with
+  # $(patsubst src/%.c,...), which leaves anything not under src/ unchanged -
+  # so these would land in the object list still named .c, and the dependency
+  # -include would try to read a C file as a makefile.
+  SRC_SHARED += $(N31LAUNCHER)/backlight.c $(N31LAUNCHER)/status.c
   INCLUDES += -Isrc/ui/lvgl -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include \
-	-I$(LVGL)/include/lvgl
+	-I$(LVGL)/include/lvgl -I$(N31LAUNCHER)
   CDEFS += -DTP_WITH_LVGL=1 -DLV_CONF_INCLUDE_SIMPLE \
 	-DLV_CONF_PATH='"lv_conf_tp.h"'
 endif
@@ -180,6 +196,17 @@ else
 endif
 
 APP_OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRC_APP))
+
+# The launcher's shared sources, built into their own subdirectory so their
+# names cannot collide with anything under src/.
+SHARED_OBJS := $(patsubst $(N31LAUNCHER)/%.c,$(BUILD)/n31launcher/%.o,$(SRC_SHARED))
+APP_OBJS += $(SHARED_OBJS)
+
+$(BUILD)/n31launcher/%.o: $(N31LAUNCHER)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+-include $(SHARED_OBJS:.o=.d)
 
 # What each object was built against. Missing on a first build, which is
 # fine - there is nothing stale to catch yet.
