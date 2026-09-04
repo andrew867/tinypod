@@ -16,6 +16,7 @@
 #include "tp_lv_screens.h"
 #include "tp_lv_input.h"
 #include "tp_volume.h"
+#include "tp_badfile.h"
 #include "backlight.h"
 #include "status.h"
 
@@ -718,10 +719,17 @@ static void fill_queue(int i, struct tp_lv_row *out, void *ctx)
             out->line2 = sub2[slot];
         }
     }
-    if (!out->line1)
+    if (!out->line1) {
         out->line1 = it->title ? it->title : it->path;
+        /* The tags gave an artist for a file the library never saw. */
+        if (it->artist) {
+            snprintf(sub2[slot], sizeof sub2[0], "%s", it->artist);
+            out->line2 = sub2[slot];
+        }
+    }
 
     out->playing = ((size_t)i == app->queue.pos) ? true : false;
+    out->dim = (it->path && tp_badfile_is_bad(it->path)) ? true : false;
 }
 
 static void fill_settings(int i, struct tp_lv_row *out, void *ctx)
@@ -1395,8 +1403,16 @@ static void draw(void)
                 n.total = (int)app->queue.count;
 
                 /* A file the library has never heard of: its own name. */
-                if (!t && it->title)
-                    n.title = it->title;
+                /*
+                 * A file the library has never heard of, described by its own
+                 * tags. Before those were read, a folder of music showed a
+                 * column of file names and no artist at all.
+                 */
+                if (!t) {
+                    if (it->title)  n.title  = it->title;
+                    if (it->artist) n.artist = it->artist;
+                    if (it->album)  n.album  = it->album;
+                }
             }
         }
 
@@ -1924,56 +1940,55 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
          */
         if (s_ui.was_playing &&
             tp_player_state(app->player) == TP_PLAYER_STOPPED) {
-            const char *e = tp_player_last_error(app->player);
+            enum tp_stop_reason why = tp_player_stop_reason(app->player);
 
             s_ui.was_playing = 0;
 
             /*
-             * A track that FAILED is not a track that finished, and which one
-             * it was decides whether to move on.
+             * Why it stopped, asked rather than inferred.
              *
-             * This used to advance on stopped alone. With a working device
-             * those are the same thing; with a broken one they are not. The
-             * sink fails to open, the track stops instantly, the queue steps
-             * to the next, and the app walks the whole library in a few
-             * seconds saying nothing - which is exactly what was reported.
-             *
-             * So an error stops the queue and stays on screen. And a run of
-             * tracks that each end immediately is a broken device rather than
-             * a run of empty files, so that stops too: a sink that fails
-             * without setting a message would otherwise gallop just as
-             * silently.
+             * This used to read the error string and the elapsed time and
+             * guess between three cases that look identical from outside: a
+             * track that ended, a track that never opened, and a stop
+             * somebody asked for. It guessed wrong on the one that matters -
+             * a file that would not open looked like a track that had
+             * finished - and the queue moved on twice.
              */
-            if (e && e[0]) {
-                s_ui.fail_run = 0;
-                redraw = 1;              /* Now Playing shows it; do not advance */
+            if (why == TP_STOP_USER) {
+                /* Asked for. Whoever asked has already done the thinking. */
+                redraw = 1;
             } else {
-                if (tp_player_position_ms(app->player) < TP_TOO_SHORT_MS)
-                    s_ui.fail_run++;
-                else
-                    s_ui.fail_run = 0;
+                if (why == TP_STOP_FAILED) {
+                    /*
+                     * Remember it and carry on. The volume returns read
+                     * errors on whole regions, so a file that will not open
+                     * is an ordinary event; stopping the queue over one would
+                     * make the player unusable, and the mark is what stops it
+                     * being tried again every time round.
+                     */
+                    const struct tp_queue_item *it =
+                        tp_queue_current(&app->queue);
 
-                if (s_ui.fail_run >= TP_FAIL_RUN_MAX) {
-                    tp_lv_show_message(
-                        "Playback stopped",
-                        "Several tracks ended immediately.\n\n"
-                        "The audio device is most likely refusing output. "
-                        "The files themselves are probably fine.");
-                } else if (app->queue.count > 0 &&
-                           tp_app_cmd_advance(app) == 0) {
-                    /* advance, not next: this is a track ENDING, which is
-                       what Repeat One is about. At the end of a queue with
-                       repeat off it returns non-zero and playback stops,
-                       which is what Off means. */
-                    s_ui.was_playing = 1;
-                } else {
-                    s_ui.was_playing = 0;
+                    if (it && it->path)
+                        tp_badfile_mark(it->path);
                 }
+
+                /*
+                 * Move on either way.
+                 *
+                 * advance, not next: a track ending is not the Next button,
+                 * and the difference is Repeat One. When it returns non-zero
+                 * there is genuinely nowhere left - the end of a queue with
+                 * repeat off, or a queue in which nothing at all will read -
+                 * and playback stops having run out rather than having given
+                 * up.
+                 */
+                if (app->queue.count > 0 && tp_app_cmd_advance(app) == 0)
+                    s_ui.was_playing = 1;
                 redraw = 1;
             }
         } else if (tp_player_state(app->player) == TP_PLAYER_PLAYING) {
             s_ui.was_playing = 1;
-            s_ui.fail_run = 0;
         }
 
         /* Now Playing has a clock on it and must tick without a keypress. */

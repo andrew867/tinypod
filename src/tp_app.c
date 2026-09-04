@@ -1,5 +1,6 @@
 #include "tp_app.h"
 #include "fs/tp_browse.h"
+#include "util/tp_badfile.h"
 #include "util/tp_diag.h"
 #include "tp_decode.h"
 #include "tp_sink.h"
@@ -357,13 +358,27 @@ int tp_app_play_current(struct tp_app *app)
     if (!it)
         return 1;
 
+    /*
+     * Chosen deliberately, so try it whichever list it is on.
+     *
+     * step_to_playable skips what is known bad when it is MOVING through a
+     * queue; picking a row is a different intent, and on a volume that fails
+     * intermittently it is also the only way back for a file that has since
+     * become readable. Success below clears the mark.
+     */
     if (it->id && (t = tp_library_find_track(&app->lib, it->id)) != NULL) {
         app->cfg.last_track_id = t->track_id;
         tp_config_save(&app->cfg);
-        return tp_player_play_track(app->player, t) == 0 ? 0 : 1;
+        if (tp_player_play_track(app->player, t) != 0)
+            return 1;
+        tp_badfile_clear(it->path);
+        return 0;
     }
 
-    return tp_player_play_file(app->player, it->path) == 0 ? 0 : 1;
+    if (tp_player_play_file(app->player, it->path) != 0)
+        return 1;
+    tp_badfile_clear(it->path);
+    return 0;
 }
 
 int tp_app_cmd_play_id(struct tp_app *app, uint64_t id)
@@ -441,6 +456,39 @@ int tp_app_cmd_resume(struct tp_app *app)
 }
 
 /*
+ * Move, and keep moving until the queue is pointing at something worth
+ * trying.
+ *
+ * A file that would not read is stepped over rather than played and failed
+ * again. The volume behind this player returns read errors on whole regions,
+ * so a bad file is an ordinary event and stopping on one would make the
+ * player unusable - but retrying one every time round a repeating queue is
+ * just as bad, only noisier.
+ *
+ * Bounded by the length of the queue, which is what makes a queue where
+ * NOTHING reads terminate: every entry is tried once and then there is
+ * nowhere left to go, and playback stops having genuinely run out rather than
+ * spinning at full tilt for as long as the battery lasts.
+ */
+static int step_to_playable(struct tp_play_queue *q,
+                            int (*step)(struct tp_play_queue *))
+{
+    size_t tried;
+
+    for (tried = 0; tried < q->count; tried++) {
+        const struct tp_queue_item *it;
+
+        if (step(q) != 0)
+            return -1;
+
+        it = tp_queue_current(q);
+        if (!it || !it->path || !tp_badfile_is_bad(it->path))
+            return 0;
+    }
+    return -1;
+}
+
+/*
  * Nothing queued and nothing said about what to queue: fall back to the
  * library, loading it if that has not happened yet.
  *
@@ -481,7 +529,7 @@ int tp_app_cmd_next(struct tp_app *app)
 {
     if (app->queue.count == 0 && fall_back_to_library(app) != 0)
         return 1;
-    if (tp_queue_skip_next(&app->queue) != 0)
+    if (step_to_playable(&app->queue, tp_queue_skip_next) != 0)
         return 1;
     return tp_app_play_current(app);
 }
@@ -494,7 +542,7 @@ int tp_app_cmd_advance(struct tp_app *app)
        this was continuing. */
     if (app->queue.count == 0)
         return 1;
-    if (tp_queue_next(&app->queue) != 0)
+    if (step_to_playable(&app->queue, tp_queue_next) != 0)
         return 1;
     return tp_app_play_current(app);
 }
@@ -508,7 +556,7 @@ int tp_app_cmd_prev(struct tp_app *app)
     if (tp_player_position_ms(app->player) >= TP_PREV_RESTART_MS)
         return tp_app_play_current(app);
 
-    if (tp_queue_prev(&app->queue) != 0)
+    if (step_to_playable(&app->queue, tp_queue_prev) != 0)
         return 1;
     return tp_app_play_current(app);
 }

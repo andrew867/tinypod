@@ -30,6 +30,7 @@ SRC_APP := \
 	src/util/tp_io.c \
 	src/util/tp_util.c \
 	src/util/tp_config.c \
+	src/util/tp_badfile.c \
 	src/util/tp_volume.c \
 	src/fs/tp_browse.c \
 	src/fs/tp_mount_detect.c \
@@ -41,9 +42,11 @@ SRC_APP := \
 	src/db/tp_db_classic_itunesdb.c \
 	src/db/tp_db_raw_scan.c \
 	src/codec/tp_mp4.c \
+	src/codec/tp_tags.c \
 	src/codec/tp_decode.c \
 	src/playback/tp_player.c \
 	src/playback/tp_sink.c \
+	src/playback/tp_shuffle.c \
 	src/ui/tp_ui_fb.c \
 	src/ui/tp_ui_keys.c
 

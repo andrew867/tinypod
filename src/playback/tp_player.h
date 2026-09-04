@@ -9,6 +9,26 @@ enum tp_player_backend {
     TP_PLAYER_ALSA
 };
 
+/*
+ * Why the player is not playing.
+ *
+ * A stopped player used to be one fact with three causes behind it, and the
+ * interfaces guessed between them by looking at the error string and the
+ * elapsed time: no message and a full track meant the end, a message meant a
+ * failure, and a deliberate stop looked exactly like the end. That guess was
+ * wrong often enough to be the bug people reported - a file that would not
+ * open read as a track that had finished, so the queue moved on twice.
+ *
+ * So the player answers it directly. Set once, under the same lock as the
+ * state it belongs to, and cleared when something new starts.
+ */
+enum tp_stop_reason {
+    TP_STOP_NONE = 0,   /* playing, or nothing has been played yet */
+    TP_STOP_ENDED,      /* the track reached its end */
+    TP_STOP_FAILED,     /* would not open, or died part-way through */
+    TP_STOP_USER        /* somebody asked it to stop */
+};
+
 enum tp_player_state {
     TP_PLAYER_STOPPED = 0,
     TP_PLAYER_PLAYING,
@@ -41,6 +61,15 @@ int tp_player_stop(struct tp_player *p);
  */
 void tp_player_set_async(struct tp_player *p, int async);
 enum tp_player_state tp_player_state(struct tp_player *p);
+
+/*
+ * Why it stopped. Meaningless while it is playing, where it reads TP_STOP_NONE.
+ *
+ * TP_STOP_ENDED is the only one that means "move to the next track". Anything
+ * else is either a failure the caller should record and step over, or a stop
+ * the caller asked for and already knows about.
+ */
+enum tp_stop_reason tp_player_stop_reason(struct tp_player *p);
 const char *tp_player_backend_name(enum tp_player_backend b);
 enum tp_player_backend tp_player_backend_from_name(const char *name);
 
@@ -104,7 +133,26 @@ const char *tp_player_current_title(struct tp_player *p);
 struct tp_queue_item {
     uint64_t id;
     char    *path;
+
+    /*
+     * What to put on screen, resolved once when the queue is built.
+     *
+     * Null for a track the library knows, because the library has better and
+     * keeping a second copy is how the two drift apart. Set for anything else
+     * - from the file's own tags where it has them, and from its name where
+     * it does not - which is what stopped a folder of music showing a column
+     * of file names and no artist at all.
+     */
     char    *title;
+    char    *artist;
+    char    *album;
+
+    /*
+     * What shuffle holds apart: the artist, or the album where there is no
+     * artist, as a hash. Zero means ungrouped, and ungrouped entries are
+     * never spaced against anything.
+     */
+    uint32_t group;
 };
 
 enum tp_repeat {

@@ -26,6 +26,13 @@ struct tp_lv_row {
     const char *line2;
     const char *badge;     /* right-hand text, e.g. a duration or a count */
     bool        playing;   /* mark the row that is currently sounding */
+    /*
+     * Present but unplayable - the volume would not read it. Drawn greyed
+     * out, the way iTunes marks a file it cannot find, because a row that
+     * simply does nothing when you press it is worse than one that says so
+     * before you do.
+     */
+    bool        dim;
 };
 
 /* Everything Now Playing draws. */

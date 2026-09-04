@@ -9,6 +9,7 @@
 #include "tp_browse.h"
 #include "tp_app.h"
 #include "tp_player.h"
+#include "tp_badfile.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -784,11 +785,11 @@ static void test_queue_folder_playback(void)
 }
 
 /*
- * Fault 2: a file that will not open must not move the queue twice.
+ * A file that will not read is stepped over, and the queue keeps going.
  *
- * The volume this runs on returns read errors, so a track failing to open is
- * an ordinary event rather than an exotic one. Deleting a file out from under
- * a built queue is the same thing from the player's point of view, and it is
+ * The volume behind this player returns read errors on whole regions, so this
+ * is an ordinary event rather than an exotic one. Deleting a file out from
+ * under a built queue is the same thing from the player's point of view and
  * the only way to produce it deterministically.
  */
 static void test_queue_survives_a_bad_file(void)
@@ -796,11 +797,12 @@ static void test_queue_survives_a_bad_file(void)
     const char *dir = "/tmp/tp_queue_bad";
     struct tp_app app;
     char first[512], third[512];
-    int before;
 
     make_folder(dir, 5);
     snprintf(first, sizeof first, "%s/01 track.mp3", dir);
     snprintf(third, sizeof third, "%s/03 track.mp3", dir);
+
+    tp_badfile_reset();
 
     tp_app_init(&app, "/nonexistent", TP_PLAYER_NULL);
     app.cfg.shuffle = 0;
@@ -811,23 +813,74 @@ static void test_queue_survives_a_bad_file(void)
     /* Track three is now unreadable, exactly as the FTL makes them. */
     unlink(third);
 
-    /* Two forward: onto two, then onto the broken three. */
+    /* Onto two, which is fine. */
     EXPECT(tp_app_cmd_next(&app) == 0);
-    before = queue_track_no(&app);
-    EXPECT(before == 2);
+    EXPECT(queue_track_no(&app) == 2);
 
     /*
-     * Next onto a file that will not open. Whatever the result, the queue may
-     * not end up further than the next playable track - a failure that also
-     * advances puts it two on, which is the reported "next skips two".
+     * Onto three, which is not. The command reports the failure - it has to,
+     * or the interface could not tell this from a track that played - and the
+     * queue is left sitting on the track that failed so that whoever asked
+     * knows which one it was.
      */
-    tp_app_cmd_next(&app);
-    EXPECT(queue_track_no(&app) == 3 || queue_track_no(&app) == 4);
+    EXPECT(tp_app_cmd_next(&app) != 0);
+    EXPECT(queue_track_no(&app) == 3);
 
-    /* And the queue is still usable afterwards, not wedged. */
-    EXPECT(app.queue.count == 5);
+    /* Which is what the interface does with that: remember it. */
+    tp_badfile_mark(third);
+    EXPECT(tp_badfile_is_bad(third));
+
+    /* And from here on it is stepped over rather than tried again. */
+    EXPECT(tp_app_cmd_next(&app) == 0);
+    EXPECT(queue_track_no(&app) == 4);
+
+    /* Backwards over it too, from four to two. */
+    EXPECT(tp_app_cmd_prev(&app) == 0);
+    EXPECT(queue_track_no(&app) == 2);
 
     tp_app_free(&app);
+    tp_badfile_reset();
+}
+
+/*
+ * A queue in which nothing reads has to stop, not spin.
+ *
+ * Stepping over what will not play is bounded by the length of the queue for
+ * exactly this case: with repeat on and every entry bad, an unbounded search
+ * would sit at full tilt for as long as the battery lasted.
+ */
+static void test_queue_all_bad_terminates(void)
+{
+    const char *dir = "/tmp/tp_queue_allbad";
+    struct tp_app app;
+    char first[512];
+    int i;
+
+    make_folder(dir, 4);
+    snprintf(first, sizeof first, "%s/01 track.mp3", dir);
+
+    tp_badfile_reset();
+    tp_app_init(&app, "/nonexistent", TP_PLAYER_NULL);
+    app.cfg.shuffle = 0;
+    tp_app_cmd_play_file(&app, first);
+    EXPECT(app.queue.count == 4);
+
+    /* Repeat All, which is the setting that could loop for ever. */
+    app.queue.repeat = TP_REPEAT_ALL;
+    for (i = 1; i <= 4; i++) {
+        char path[512];
+
+        snprintf(path, sizeof path, "%s/%02d track.mp3", dir, i);
+        tp_badfile_mark(path);
+    }
+
+    /* Every entry tried once, then nowhere left to go - and it returns rather
+       than looping. Reaching this line at all is the assertion. */
+    EXPECT(tp_app_cmd_advance(&app) != 0);
+    EXPECT(tp_app_cmd_next(&app) != 0);
+
+    tp_app_free(&app);
+    tp_badfile_reset();
 }
 
 int main(void)
@@ -854,6 +907,7 @@ int main(void)
     test_sink_resample();
     test_queue_folder_playback();
     test_queue_survives_a_bad_file();
+    test_queue_all_bad_terminates();
     if (g_fail) {
         fprintf(stderr, "%d test(s) failed\n", g_fail);
         return 1;

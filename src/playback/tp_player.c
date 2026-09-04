@@ -11,6 +11,8 @@
  */
 #include "tp_player.h"
 #include "../fs/tp_browse.h"
+#include "../codec/tp_tags.h"
+#include "tp_shuffle.h"
 #include "tp_decode.h"
 #include "tp_sink.h"
 #include "tp_util.h"
@@ -41,6 +43,7 @@ static unsigned long long mono_ns(void)
 struct tp_player {
     enum tp_player_backend backend;
     enum tp_player_state state;
+    enum tp_stop_reason  stop_reason;
     pid_t child;
     char *current_path;
     char *current_title;
@@ -165,6 +168,13 @@ static void *play_thread(void *arg)
     int16_t *block = NULL;
     char err[256] = "";
     int paused_sink = 0;
+    /*
+     * Failure until proved otherwise. Every way out of this function below is
+     * either an explicit end, an explicit stop, or something going wrong -
+     * and if a path is ever added that forgets to say which, treating it as a
+     * failure stops the queue rather than letting it run away.
+     */
+    enum tp_stop_reason reason = TP_STOP_FAILED;
 
     block = malloc(sizeof(int16_t) * TP_DEC_MAX_BLOCK);
     if (!block) {
@@ -203,6 +213,7 @@ static void *play_thread(void *arg)
         }
         if (p->req_stop) {
             pthread_mutex_unlock(&p->lock);
+            reason = TP_STOP_USER;
             break;
         }
         pthread_mutex_unlock(&p->lock);
@@ -253,8 +264,10 @@ static void *play_thread(void *arg)
             snprintf(err, sizeof(err), "decoding stopped part-way through the track");
             break;
         }
-        if (n == 0)
-            break;                      /* end of track */
+        if (n == 0) {
+            reason = TP_STOP_ENDED;     /* the only way to the next track */
+            break;
+        }
 
         if (tp_sink_write(sink, block, n) != 0) {
             snprintf(err, sizeof(err), "the audio device stopped accepting data");
@@ -279,11 +292,52 @@ done:
     pthread_mutex_lock(&p->lock);
     if (err[0])
         snprintf(p->err, sizeof(p->err), "%s", err);
+    /*
+     * Committed here and nowhere else, beside the state it explains and under
+     * the same lock - a reader that saw one without the other would be back
+     * to guessing.
+     *
+     * A stop that was asked for overrides whatever the loop decided: the
+     * request arrives asynchronously and can land after the last read, and a
+     * deliberate stop reported as a failure would mark a perfectly good file
+     * bad.
+     */
+    if (p->req_stop)
+        reason = TP_STOP_USER;
+    p->stop_reason = reason;
     p->state = TP_PLAYER_STOPPED;
     p->done = 1;
     pthread_cond_broadcast(&p->cond);
     pthread_mutex_unlock(&p->lock);
     return NULL;
+}
+
+/*
+ * A track that never got as far as starting.
+ *
+ * The decode thread is what normally records both the message and the reason,
+ * and on these paths it never runs - so a missing or unplayable file used to
+ * return -1 having touched nothing: no error string, no state change, and
+ * whatever was playing before still playing. The caller saw a failure, the
+ * player still said PLAYING, and Now Playing named the new track over the old
+ * one's audio.
+ *
+ * Whatever was playing is stopped. Leaving it running while the queue has
+ * already moved on is precisely how the queue, the player and the screen end
+ * up disagreeing about what is playing.
+ */
+static int fail_to_start(struct tp_player *p, const char *msg)
+{
+    stop_thread(p);
+
+    /* After stop_thread, not before: the thread's own epilogue writes a
+       reason on its way out and would overwrite this one. */
+    pthread_mutex_lock(&p->lock);
+    snprintf(p->err, sizeof(p->err), "%s", msg);
+    p->stop_reason = TP_STOP_FAILED;
+    p->state = TP_PLAYER_STOPPED;
+    pthread_mutex_unlock(&p->lock);
+    return -1;
 }
 
 static int play_internal(struct tp_player *p, const char *path)
@@ -306,6 +360,7 @@ static int play_internal(struct tp_player *p, const char *path)
     p->dur_ms = 0;
     p->err[0] = 0;
     p->codec[0] = 0;
+    p->stop_reason = TP_STOP_NONE;
     p->state = TP_PLAYER_PLAYING;
     pthread_mutex_unlock(&p->lock);
 
@@ -337,6 +392,19 @@ void tp_player_destroy(struct tp_player *p)
     pthread_cond_destroy(&p->cond);
     pthread_mutex_destroy(&p->lock);
     free(p);
+}
+
+enum tp_stop_reason tp_player_stop_reason(struct tp_player *p)
+{
+    enum tp_stop_reason r;
+
+    if (!p)
+        return TP_STOP_NONE;
+
+    pthread_mutex_lock(&p->lock);
+    r = p->stop_reason;
+    pthread_mutex_unlock(&p->lock);
+    return r;
 }
 
 enum tp_player_state tp_player_state(struct tp_player *p)
@@ -691,12 +759,12 @@ int tp_player_play_file(struct tp_player *p, const char *path)
     }
     if (!tp_is_readable_file(path)) {
         tp_error("Could not find the audio file for this track.\nResolved path:\n  %s", path);
-        return -1;
+        return fail_to_start(p, "the file could not be read");
     }
     c = tp_file_probe_codec(path);
     if (c == TP_CODEC_PROTECTED_UNSUPPORTED) {
         tp_error("This track is protected (FairPlay) and cannot be decoded.\n  %s", path);
-        return -1;
+        return fail_to_start(p, "protected, and this build cannot decode it");
     }
 
     switch (p->backend) {
@@ -855,7 +923,12 @@ int tp_player_stop(struct tp_player *p)
         return -1;
     stop_thread(p);
     kill_child(p);
+    pthread_mutex_lock(&p->lock);
+    /* Said here as well as in the thread epilogue: with no thread running
+       there is no epilogue, and a stop is still a stop. */
+    p->stop_reason = TP_STOP_USER;
     p->state = TP_PLAYER_STOPPED;
+    pthread_mutex_unlock(&p->lock);
     tp_info("stopped");
     return 0;
 }
@@ -874,6 +947,8 @@ void tp_queue_free(struct tp_play_queue *q)
     for (i = 0; i < q->count; i++) {
         free(q->items[i].path);
         free(q->items[i].title);
+        free(q->items[i].artist);
+        free(q->items[i].album);
     }
     free(q->items);
     free(q->order);
@@ -922,18 +997,47 @@ static void order_identity(struct tp_play_queue *q)
         q->order[i] = i;
 }
 
+/*
+ * A shuffle that does not put three tracks off one album in a row.
+ *
+ * This was a plain Fisher-Yates over rand(), which had two faults worth
+ * naming. It clustered - a hundred tracks across ten artists averaged nine
+ * adjacent same-artist pairs, which is what makes people say shuffle is
+ * broken - and srand is called nowhere in this program, so every boot dealt
+ * the identical order.
+ *
+ * tp_shuffle_order fixes the clustering; the seed here fixes the other. The
+ * clock is enough: this decides a listening order, not a key.
+ */
 static void order_shuffle(struct tp_play_queue *q)
 {
+    struct tp_shuffle_item *items;
     size_t i;
 
     order_identity(q);
-    for (i = q->count; i > 1; i--) {
-        size_t j = (size_t)(rand() % (int)i);
-        size_t t = q->order[i - 1];
+    if (q->count < 2)
+        return;
 
-        q->order[i - 1] = q->order[j];
-        q->order[j] = t;
+    items = calloc(q->count, sizeof *items);
+    if (!items) {
+        /* No grouping is still a shuffle. Falling back to the plain order
+           would be worse than an unspread one. */
+        for (i = q->count; i > 1; i--) {
+            size_t j = (size_t)(rand() % (int)i);
+            size_t t = q->order[i - 1];
+
+            q->order[i - 1] = q->order[j];
+            q->order[j] = t;
+        }
+        return;
     }
+
+    for (i = 0; i < q->count; i++)
+        items[i].group = q->items[i].group;
+
+    tp_shuffle_order(items, q->count, q->order,
+                     (unsigned)time(NULL) ^ (unsigned)(uintptr_t)q);
+    free(items);
 }
 
 /* Put the running order at whichever slot plays item `want`. */
@@ -957,6 +1061,12 @@ void tp_queue_set_shuffle(struct tp_play_queue *q, int shuffle)
     if (!q || !q->count || !!q->shuffle == !!shuffle)
         return;
 
+    /* pos is an index into order and every other function assumes it is in
+       range; this one is reached from a settings screen that can be opened at
+       any moment, so it checks rather than assuming. */
+    if (q->pos >= q->count)
+        q->pos = 0;
+
     playing = q->order[q->pos];
     q->shuffle = shuffle ? 1 : 0;
 
@@ -968,6 +1078,9 @@ void tp_queue_set_shuffle(struct tp_play_queue *q, int shuffle)
     seek_to_item(q, playing);
 }
 
+/* Defined with the other item-building helpers below, and used above them. */
+static uint32_t group_key(const char *artist, const char *album);
+
 int tp_queue_from_library(struct tp_play_queue *q, struct tp_library *lib, int shuffle)
 {
     size_t i;
@@ -978,6 +1091,8 @@ int tp_queue_from_library(struct tp_play_queue *q, struct tp_library *lib, int s
     for (i = 0; i < lib->track_count; i++) {
         q->items[i].id = lib->tracks[i].track_id;
         q->items[i].path = tp_strdup(lib->tracks[i].absolute_path);
+        q->items[i].group = group_key(lib->tracks[i].artist,
+                                      lib->tracks[i].album);
     }
     q->count = lib->track_count;
     q->shuffle = shuffle ? 1 : 0;
@@ -1011,6 +1126,8 @@ int tp_queue_from_indices(struct tp_play_queue *q, struct tp_library *lib,
                 continue;
             q->items[k].id = lib->tracks[idx[i]].track_id;
             q->items[k].path = tp_strdup(lib->tracks[idx[i]].absolute_path);
+            q->items[k].group = group_key(lib->tracks[idx[i]].artist,
+                                          lib->tracks[idx[i]].album);
             if (idx[i] == start)
                 start_at = k;
             k++;
@@ -1095,6 +1212,46 @@ static char *title_from_path(const char *path)
 }
 
 /* Fill one item in, taking the library's word for it where there is one. */
+/*
+ * What to hold apart when shuffling: the artist, or the album where a file
+ * names no artist. Zero for something that names neither, which leaves it
+ * ungrouped and free to land anywhere.
+ *
+ * FNV-1a, case-folded, because "The Beatles" and "the beatles" are one artist
+ * and two tags. A collision here spaces two artists as though they were one,
+ * which nobody will ever notice.
+ */
+static uint32_t group_key(const char *artist, const char *album)
+{
+    const char *s = (artist && *artist) ? artist
+                  : (album && *album)   ? album
+                  : NULL;
+    uint32_t h = 2166136261u;
+
+    if (!s)
+        return 0;
+
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+
+        if (c >= 'A' && c <= 'Z')
+            c = (unsigned char)(c - 'A' + 'a');
+        h = (h ^ c) * 16777619u;
+    }
+    /* Zero is reserved for "ungrouped", so a real name must not produce it. */
+    return h ? h : 1u;
+}
+
+/*
+ * Fill one item in, taking the library's word for it where there is one and
+ * the file's own tags where there is not.
+ *
+ * The tags are read here, once, rather than when a row is drawn: a queue is
+ * built on a keypress and a row is drawn six times a frame, and this reads
+ * from a volume where a read can take milliseconds or fail outright. A file
+ * with no tags falls back to its name, which is what the browser showed for
+ * everything before.
+ */
 static void item_set(struct tp_queue_item *it, struct tp_library *lib,
                      const char *path)
 {
@@ -1104,9 +1261,22 @@ static void item_set(struct tp_queue_item *it, struct tp_library *lib,
     if (t) {
         it->id = t->track_id;
         it->title = NULL;        /* the library has a better one */
-    } else {
-        it->id = 0;
-        it->title = title_from_path(path);
+        it->group = group_key(t->artist, t->album);
+        return;
+    }
+
+    it->id = 0;
+    {
+        struct tp_tags tags;
+
+        if (tp_tags_read(path, &tags)) {
+            it->title  = tags.title[0]  ? tp_strdup(tags.title)  : NULL;
+            it->artist = tags.artist[0] ? tp_strdup(tags.artist) : NULL;
+            it->album  = tags.album[0]  ? tp_strdup(tags.album)  : NULL;
+            it->group  = group_key(tags.artist, tags.album);
+        }
+        if (!it->title)
+            it->title = title_from_path(path);
     }
 }
 

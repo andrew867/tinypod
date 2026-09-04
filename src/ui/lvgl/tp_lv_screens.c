@@ -380,8 +380,11 @@ static void fill_row(row_t *r, const struct tp_lv_row *src, bool sel)
                                   : (sel ? dim(C_ACCENT) : C_BG)), 0);
 
     lv_label_set_text(r->line1, src->line1 ? src->line1 : "");
+    /* A row the volume will not read drops a step even when it is selected,
+       which is how iTunes marks a file it cannot find - visibly there, and
+       visibly not going to play. */
     lv_obj_set_style_text_color(r->line1,
-        lv_color_hex(sel ? C_TEXT : C_TEXT_DIM), 0);
+        lv_color_hex(src->dim ? C_TEXT_MUTE : (sel ? C_TEXT : C_TEXT_DIM)), 0);
 
     lv_label_set_text(r->line2, src->line2 ? src->line2 : "");
     lv_obj_set_style_text_color(r->line2,
