@@ -1212,8 +1212,8 @@ static void activate(void)
         } else if (tp_player_state(app->player) == TP_PLAYER_PAUSED) {
             tp_app_cmd_resume(app);
         } else if (app->queue.count) {
-            tp_app_play_current(app);
-            s_ui.was_playing = 1;
+            if (tp_app_play_current(app) == 0)
+                s_ui.was_playing = 1;
         }
         break;
 
@@ -1533,11 +1533,18 @@ static void on_key(enum tp_lv_key k)
             return;
         }
 
-        if (dir < 0)
-            tp_app_cmd_prev(app);
-        else
-            tp_app_cmd_next(app);
-        s_ui.was_playing = 1;
+        /*
+         * Armed only if something actually started.
+         *
+         * This used to arm unconditionally. When the command failed - the end
+         * of a queue with repeat off, or a file that would not open - the
+         * detector fired on the next pass, saw a stopped player with no error
+         * and no elapsed time, and moved the queue AGAIN. That is the
+         * reported "Next skips two", and on Previous it is worse: the second
+         * move is an advance, so Previous ends up somewhere ahead.
+         */
+        if ((dir < 0 ? tp_app_cmd_prev(app) : tp_app_cmd_next(app)) == 0)
+            s_ui.was_playing = 1;
         return;
     }
 
@@ -1854,13 +1861,19 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
             n31_backlight_off();
         }
 
-        /* Nothing to draw behind a dark panel. LVGL still ticks, so what is
-           on it stays consistent for when it comes back. */
-        if (s_ui.blanked) {
-            lv_timer_handler();
-            usleep(FRAME_MS * 1000u);
-            continue;
-        }
+        /*
+         * Behind a dark panel there is nothing to DRAW. There is still
+         * everything else to do.
+         *
+         * This used to `continue` here, and the rest of the loop is where a
+         * finished track is noticed - so the music stopped twenty seconds
+         * after the screen went dark, which is to say whenever the device
+         * went into a pocket. Blanking is a decision about the panel and must
+         * never become a decision about playback.
+         *
+         * So nothing skips any more; the two things that only matter to a
+         * panel somebody is looking at are guarded individually below.
+         */
 
         /*
          * Write down where we are, and apply a pending resume once the track
@@ -1890,7 +1903,7 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
             }
         }
 
-        if (now_ms() - s_ui.last_status >= STATUS_MS) {
+        if (!s_ui.blanked && now_ms() - s_ui.last_status >= STATUS_MS) {
             n31_status_t st;
 
             s_ui.last_status = now_ms();
@@ -1970,7 +1983,10 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
             redraw = 1;
         }
 
-        if (redraw)
+        /* Not behind a dark panel: draw() walks every visible row and asks
+           the library for each one, which is real work for nobody. The screen
+           is repainted on the press that wakes it. */
+        if (redraw && !s_ui.blanked)
             draw();
 
         lv_timer_handler();

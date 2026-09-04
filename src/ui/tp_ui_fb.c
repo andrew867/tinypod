@@ -466,8 +466,14 @@ int tp_ui_fb_run(struct tp_app *app)
             st = tp_player_state(app->player);
             if (ui.was_playing && st == TP_PLAYER_STOPPED) {
                 ui.was_playing = 0;
-                /* Ended on its own - roll on to the next queued track. */
-                if (app->queue.count > 0 && tp_app_cmd_next(app) == 0)
+                /*
+                 * advance, not next.
+                 *
+                 * A track ending is not the Next button, and the difference
+                 * is Repeat One - which this front end silently did not
+                 * honour, because it called the button.
+                 */
+                if (app->queue.count > 0 && tp_app_cmd_advance(app) == 0)
                     ui.was_playing = 1;
             } else if (st == TP_PLAYER_PLAYING) {
                 ui.was_playing = 1;
