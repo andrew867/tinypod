@@ -58,6 +58,7 @@ enum view_kind {
     V_LETTERS,       /* initials, to jump into a long list with */
     V_TRACKS,        /* the tracks under an artist, album or playlist */
     V_FILES,
+    V_QUEUE,
     V_NOW,
     V_SETTINGS,
     V_ABOUT
@@ -107,10 +108,27 @@ struct view {
  */
 #define BLANK_MS 20000
 
+/*
+ * How often the place in the track is written down.
+ *
+ * Every few seconds rather than on exit: this device is switched off by
+ * holding the power button, and nothing gets to run at that point - so a
+ * position only written on a clean exit is a position usually not written.
+ *
+ * The config lands in /tmp when HOME is unset, which is a tmpfs, so today
+ * this survives leaving and reopening the app but not a reboot. It will
+ * survive one the moment there is somewhere writable to put it.
+ */
+#define RESUME_SAVE_MS 5000
+
 /* How often the status bar re-reads the battery. It is a median over a window
    of voltage readings and moves slowly; polling it every frame would cost more
    than it tells anyone. */
 #define STATUS_MS 5000
+
+/* How far one repeat scrubs. At about thirty repeats a second a held key
+   covers a three minute track in roughly two seconds. */
+#define SEEK_STEP_MS 3000
 
 #define RUN_GAP_MS  200
 #define RUN_FAST    8      /* presses before it speeds up */
@@ -181,6 +199,16 @@ struct ui {
     /* Panel state, and when the last press was. */
     int           blanked;
     unsigned long last_input;
+    unsigned long last_status;
+    unsigned long last_resume_save;
+
+    /*
+     * Where the last session got to, held until the track it belongs to
+     * actually starts playing - the seek cannot happen until there is a
+     * decoder open to seek.
+     */
+    unsigned long resume_ms;
+    uint64_t      resume_id;
 
     int adjusting;           /* which settings row, or -1 */
     int volume;              /* last read, so the row can draw without a
@@ -212,6 +240,7 @@ static const struct {
     { "Playlists",   NULL },
     { "Folders",     NULL },
     { "Now Playing", NULL },
+    { "Queue",       NULL },
     { "Settings",    NULL },
     { "About",       NULL },
 };
@@ -660,6 +689,41 @@ static void fill_tracks(int i, struct tp_lv_row *out, void *ctx)
 #define S_STOP    6
 #define SETTINGS_N 7
 
+/*
+ * The running order, as it will actually play.
+ *
+ * Indexed through order[] rather than over the items, so with shuffle on this
+ * is the shuffled sequence and not the album - which is the whole point of
+ * being able to look at it.
+ */
+static void fill_queue(int i, struct tp_lv_row *out, void *ctx)
+{
+    struct tp_app *app = ctx;
+    const struct tp_queue_item *it;
+    static char sub2[8][64];
+    int slot = i % 8;
+
+    if (i < 0 || (size_t)i >= app->queue.count)
+        return;
+
+    it = &app->queue.items[app->queue.order[i]];
+
+    if (it->id) {
+        struct tp_track *t = tp_library_find_track(&app->lib, it->id);
+
+        if (t) {
+            out->line1 = safe(t->title, "Unknown title");
+            snprintf(sub2[slot], sizeof sub2[0], "%s",
+                     safe(t->artist, "Unknown artist"));
+            out->line2 = sub2[slot];
+        }
+    }
+    if (!out->line1)
+        out->line1 = it->title ? it->title : it->path;
+
+    out->playing = ((size_t)i == app->queue.pos) ? true : false;
+}
+
 static void fill_settings(int i, struct tp_lv_row *out, void *ctx)
 {
     struct tp_app *app = ctx;
@@ -917,6 +981,7 @@ static int view_count(struct view *v)
     case V_ARTIST_ALBUMS: return (int)s_ui.falbums_n;
     case V_TRACKS:    return (int)s_ui.filtered_n + jump_offset(V_TRACKS);
     case V_FILES:     return (int)s_ui.browse.count + head_rows(V_FILES);
+    case V_QUEUE:     return (int)s_ui.app->queue.count;
     case V_SETTINGS:  return SETTINGS_N;
     default:          return 0;
     }
@@ -974,7 +1039,13 @@ static void activate(void)
             push(V_FILES, 0, NULL);
             break;
         case 6: push(V_NOW, 0, NULL); break;
-        case 7: push(V_SETTINGS, 0, NULL); break;
+        case 7:
+            /* Land on what is playing rather than at the top: in a queue of
+               five hundred, the interesting end is where you are. */
+            push(V_QUEUE, 0, NULL);
+            top_view()->sel = (int)app->queue.pos;
+            break;
+        case 8: push(V_SETTINGS, 0, NULL); break;
         default: push(V_ABOUT, 0, NULL); break;
         }
         break;
@@ -1146,6 +1217,18 @@ static void activate(void)
         }
         break;
 
+    case V_QUEUE:
+        /* Jump straight to it: the position IS the selection here. */
+        if (v->sel >= 0 && (size_t)v->sel < app->queue.count) {
+            app->queue.pos = (size_t)v->sel;
+            push(V_NOW, 0, NULL);
+            draw();
+            lv_refr_now(NULL);
+            if (tp_app_play_current(app) == 0)
+                s_ui.was_playing = 1;
+        }
+        break;
+
     case V_SETTINGS:
         if (v->sel == S_SHUFFLE) {
             app->cfg.shuffle = !app->cfg.shuffle;
@@ -1266,6 +1349,12 @@ static void draw(void)
         tp_lv_set_hint("PLAY open   HOME back");
         break;
     }
+
+    case V_QUEUE:
+        tp_lv_show_list("Queue", count, v->sel, v->top, fill_queue, app,
+                        "Nothing queued");
+        tp_lv_set_hint("PLAY jump to   HOME back");
+        break;
 
     case V_SETTINGS:
         tp_lv_show_list("Settings", count, v->sel, v->top, fill_settings, app,
@@ -1420,19 +1509,36 @@ static void on_key(enum tp_lv_key k)
         }
     }
 
-    /* On Now Playing the volume keys are transport, because there is no list
-       to move through and skipping tracks is what you actually want there. */
-    if (v->kind == V_NOW) {
-        if (k == TP_LV_UP) {
+    /*
+     * On Now Playing the volume keys are transport: a press changes track, and
+     * holding one scrubs through the track instead.
+     *
+     * Holding used to skip tracks at thirty a second, which is not something
+     * anybody wants and loses your place in a second flat. The run counter
+     * that drives list acceleration says whether this is a press or a hold,
+     * so the two gestures come apart without needing a fifth button.
+     */
+    if (v->kind == V_NOW && (k == TP_LV_UP || k == TP_LV_DOWN)) {
+        int dir = (k == TP_LV_UP) ? -1 : 1;
+        int held = scroll_step(dir) > 1 || s_ui.scroll_run >= 1;
+
+        if (held && tp_player_can_seek(app->player)) {
+            unsigned long dur = tp_player_duration_ms(app->player);
+            long pos = (long)tp_player_position_ms(app->player)
+                       + dir * SEEK_STEP_MS;
+
+            if (pos < 0) pos = 0;
+            if (dur && (unsigned long)pos > dur) pos = (long)dur;
+            tp_player_seek_ms(app->player, (unsigned long)pos);
+            return;
+        }
+
+        if (dir < 0)
             tp_app_cmd_prev(app);
-            s_ui.was_playing = 1;
-            return;
-        }
-        if (k == TP_LV_DOWN) {
+        else
             tp_app_cmd_next(app);
-            s_ui.was_playing = 1;
-            return;
-        }
+        s_ui.was_playing = 1;
+        return;
     }
 
     switch (k) {
@@ -1660,6 +1766,23 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
     if (tp_lv_input_open() == 0)
         tp_info("no button devices - nothing can be driven");
 
+    /* The panel may have been left dark by whatever ran last. */
+    n31_backlight_open();
+    n31_backlight_on();
+    s_ui.last_input = now_ms();
+
+    /*
+     * Where the last session got to.
+     *
+     * Only remembered, not resumed: opening a music player should not start
+     * playing music at you. The queue is put back on that track so Now
+     * Playing shows it, and pressing play picks up where it left off.
+     */
+    if (app->cfg.last_track_id && app->cfg.last_position_ms) {
+        s_ui.resume_id = app->cfg.last_track_id;
+        s_ui.resume_ms = app->cfg.last_position_ms;
+    }
+
     /* This front end is still running when a track fails, so it does not need
        playback to block while it finds out. */
     tp_player_set_async(app->player, 1);
@@ -1705,7 +1828,77 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
         int redraw = 0;
 
         while ((k = tp_lv_input_poll()) != TP_LV_NONE) {
+            s_ui.last_input = now_ms();
+
+            /*
+             * Blanked, any button wakes and does nothing else.
+             *
+             * Swallowing the press is the point: a button found in a pocket
+             * should light the screen, not skip the track that is playing.
+             */
+            if (s_ui.blanked) {
+                s_ui.blanked = 0;
+                n31_backlight_on();
+                redraw = 1;
+                continue;
+            }
+
             on_key(k);
+            redraw = 1;
+        }
+
+        /* Nobody looking. The panel is the largest draw on this device and
+           music does not need to be watched. */
+        if (!s_ui.blanked && now_ms() - s_ui.last_input >= BLANK_MS) {
+            s_ui.blanked = 1;
+            n31_backlight_off();
+        }
+
+        /* Nothing to draw behind a dark panel. LVGL still ticks, so what is
+           on it stays consistent for when it comes back. */
+        if (s_ui.blanked) {
+            lv_timer_handler();
+            usleep(FRAME_MS * 1000u);
+            continue;
+        }
+
+        /*
+         * Write down where we are, and apply a pending resume once the track
+         * it belongs to is actually playing.
+         */
+        if (now_ms() - s_ui.last_resume_save >= RESUME_SAVE_MS) {
+            const struct tp_queue_item *it = tp_queue_current(&app->queue);
+
+            s_ui.last_resume_save = now_ms();
+
+            if (s_ui.resume_id && it && it->id == s_ui.resume_id &&
+                tp_player_state(app->player) != TP_PLAYER_STOPPED) {
+                if (tp_player_can_seek(app->player))
+                    tp_player_seek_ms(app->player, s_ui.resume_ms);
+                /* One attempt. A format that cannot seek would otherwise be
+                   dragged back to the same spot every five seconds. */
+                s_ui.resume_id = 0;
+            } else if (tp_player_state(app->player) == TP_PLAYER_PLAYING &&
+                       it && it->id) {
+                unsigned long pos = tp_player_position_ms(app->player);
+
+                if (pos != app->cfg.last_position_ms) {
+                    app->cfg.last_position_ms = (uint32_t)pos;
+                    app->cfg.last_track_id = it->id;
+                    tp_config_save(&app->cfg);
+                }
+            }
+        }
+
+        if (now_ms() - s_ui.last_status >= STATUS_MS) {
+            n31_status_t st;
+
+            s_ui.last_status = now_ms();
+            memset(&st, 0, sizeof st);
+            n31_status_read(&st);
+            tp_lv_set_status(st.have_battery ? st.battery_pct : -1,
+                             st.charging || st.plugged,
+                             st.clock_valid, st.hours, st.minutes);
             redraw = 1;
         }
 

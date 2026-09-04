@@ -51,6 +51,20 @@ enum tp_player_backend tp_player_backend_from_name(const char *name);
  */
 int tp_player_wait(struct tp_player *p);
 
+/*
+ * Jump to `ms` into the track that is playing.
+ *
+ * Requested here and carried out on the decode thread, which is the only one
+ * that may touch the file - so this returns as soon as the request is filed
+ * and the position moves a moment later. Returns 0 if it was filed, -1 if
+ * nothing is playing or the format cannot seek.
+ */
+int tp_player_seek_ms(struct tp_player *p, unsigned long ms);
+
+/* Whether the track playing can be seeked at all, for a UI deciding whether
+   to offer it. MP4 cannot; MP3, ADTS and WAV can. */
+int tp_player_can_seek(struct tp_player *p);
+
 /* Progress and format of the track being played. Zero when idle. */
 unsigned long tp_player_position_ms(struct tp_player *p);
 

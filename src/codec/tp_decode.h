@@ -37,4 +37,25 @@ const char *tp_dec_codec_name(const struct tp_dec *d);
  */
 int tp_dec_read(struct tp_dec *d, int16_t *out);
 
+/*
+ * Jump to `ms` into the track. Returns where it actually landed, or -1 if
+ * this decoder cannot seek.
+ *
+ * WAV is exact: the format is a byte offset away from any moment in it. MP3
+ * and ADTS are proportional - the file position is moved to the same fraction
+ * through the audio data and the decoder resyncs to the next frame header, so
+ * a constant bitrate lands where you asked and a variable one lands nearby.
+ * Building a seek table would fix that, and would mean reading the whole file
+ * before it could play, which on this device costs more than the accuracy is
+ * worth.
+ *
+ * AAC in MP4 returns -1: it needs the sample table walked properly, and a
+ * proportional guess into an MP4 lands in the middle of a sample and decodes
+ * as noise. Better to say it cannot than to do it badly.
+ */
+long tp_dec_seek_ms(struct tp_dec *d, unsigned long ms);
+
+/* Whether seeking will work at all, for a UI deciding whether to offer it. */
+int tp_dec_can_seek(const struct tp_dec *d);
+
 #endif

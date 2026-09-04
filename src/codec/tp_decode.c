@@ -393,6 +393,10 @@ static int wav_parse(struct tp_dec *d, char *err, size_t errsz)
                 return -1;
             }
             d->pcm_left = (long)size;
+            /* Where the samples begin and end, which is what seeking needs
+               to turn a moment into a byte offset. */
+            d->data_start = ftell(d->f);
+            d->file_size = d->data_start + (long)size;
             break;
         } else if (fseek(d->f, (long)(size + (size & 1)), SEEK_CUR) != 0) {
             fail(err, errsz, "WAV chunk walk failed");
@@ -678,6 +682,78 @@ uint64_t tp_dec_duration_ms(const struct tp_dec *d)
 const char *tp_dec_codec_name(const struct tp_dec *d)
 {
     return d ? d->codec : "";
+}
+
+int tp_dec_can_seek(const struct tp_dec *d)
+{
+    if (!d)
+        return 0;
+    switch (d->kind) {
+    case DEC_MP3:
+    case DEC_AAC_ADTS:
+        /* Needs a data region with a known size to take a fraction of. */
+        return d->file_size > d->data_start && d->duration_ms > 0;
+    case DEC_WAV:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+long tp_dec_seek_ms(struct tp_dec *d, unsigned long ms)
+{
+    if (!tp_dec_can_seek(d))
+        return -1;
+
+    if (d->duration_ms && ms > d->duration_ms)
+        ms = (unsigned long)d->duration_ms;
+
+    if (d->kind == DEC_WAV) {
+        /* Exact, and frame-aligned: landing mid-frame would swap the
+           channels for the rest of the track. */
+        long frame = (long)d->channels * 2;
+        long off = (long)((double)ms / 1000.0 * d->rate) * frame;
+        long total = d->file_size - d->data_start;
+
+        if (off > total) off = total;
+        if (fseek(d->f, d->data_start + off, SEEK_SET) != 0)
+            return -1;
+        d->pcm_left = total - off;
+    } else {
+        /*
+         * Proportional, then let the decoder find the next frame.
+         *
+         * The read path already calls MP3FindSyncWord on whatever is in the
+         * buffer, so landing in the middle of a frame costs one frame rather
+         * than a stream of noise - which is why this can be a plain byte
+         * offset and does not need a frame index.
+         */
+        long span = d->file_size - d->data_start;
+        long off = d->duration_ms
+                       ? (long)((double)ms / (double)d->duration_ms * span)
+                       : 0;
+
+        if (off < 0) off = 0;
+        if (off > span) off = span;
+        if (fseek(d->f, d->data_start + off, SEEK_SET) != 0)
+            return -1;
+
+        /* Nothing buffered belongs to the new position. */
+        d->buf_len = 0;
+        d->buf_pos = 0;
+    }
+
+    d->eof = 0;
+
+    /*
+     * The block decoded during open belongs to the start of the track, and
+     * handing it out after a seek would play the first moment of the song
+     * from wherever you jumped to.
+     */
+    d->primed_len = 0;
+    d->primed_used = 1;
+
+    return (long)ms;
 }
 
 int tp_dec_read(struct tp_dec *d, int16_t *out)

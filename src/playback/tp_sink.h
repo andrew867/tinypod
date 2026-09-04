@@ -58,6 +58,19 @@ int tp_sink_convert_block(struct tp_sink *s, const int16_t *in, int in_frames,
  */
 void tp_sink_pause(struct tp_sink *s, int paused);
 
+/*
+ * Throw away everything queued but not yet heard, and be ready for new
+ * samples immediately.
+ *
+ * For seeking. The device holds about a third of a second, so without this a
+ * jump plays the old position for that long before the new one arrives, which
+ * sounds like the button was late rather than like a seek.
+ *
+ * The resampler is reset too: it carries filter state across calls, and
+ * feeding it a discontinuity without resetting rings it.
+ */
+void tp_sink_flush(struct tp_sink *s);
+
 void tp_sink_close(struct tp_sink *s);
 
 /* Whether this build can output audio at all. */

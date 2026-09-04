@@ -1029,6 +1029,37 @@ int tp_sink_describe(const struct tp_sink *s, char *out, size_t cap)
     return 0;
 }
 
+void tp_sink_flush(struct tp_sink *s)
+{
+    if (!s)
+        return;
+
+#if defined(TP_WITH_SOXR)
+    /*
+     * The resampler holds filter state from the samples before the jump.
+     * Clearing it costs one conversion's worth of warm-up and avoids a
+     * transient at the seam.
+     */
+    if (s->soxr)
+        soxr_clear(s->soxr);
+#endif
+
+#ifdef TINYPOD_HAVE_TINYALSA
+    if (s->kind == SINK_ALSA && s->pcm) {
+        /* stop drops what is queued; prepare makes the stream writable
+           again. The pair is what pause/resume already does, and it is the
+           only way tinyalsa offers to discard rather than play out. */
+        pcm_stop(s->pcm);
+        pcm_prepare(s->pcm);
+        return;
+    }
+#endif
+#ifdef TINYPOD_HAVE_OSS
+    if (s->kind == SINK_OSS && s->fd >= 0)
+        ioctl(s->fd, SNDCTL_DSP_RESET, 0);
+#endif
+}
+
 void tp_sink_pause(struct tp_sink *s, int paused)
 {
     if (!s)

@@ -52,6 +52,11 @@ struct tp_player {
     pthread_cond_t cond;
     int thread_live;
     int req_stop;
+    /* A seek waiting to be carried out, in ms, and whether there is one.
+       Read and cleared by the decode thread under the lock. */
+    int           req_seek;
+    unsigned long req_seek_ms;
+    int           can_seek;   /* what the open decoder said */
     int paused;
     int done;
 
@@ -181,6 +186,7 @@ static void *play_thread(void *arg)
     p->rate = tp_dec_rate(dec);
     p->channels = tp_dec_channels(dec);
     p->dur_ms = (unsigned long)tp_dec_duration_ms(dec);
+    p->can_seek = tp_dec_can_seek(dec);
     snprintf(p->codec, sizeof(p->codec), "%s", tp_dec_codec_name(dec));
     pthread_mutex_unlock(&p->lock);
 
@@ -204,6 +210,42 @@ static void *play_thread(void *arg)
         if (paused_sink) {
             tp_sink_pause(sink, 0);
             paused_sink = 0;
+        }
+
+        /*
+         * A seek, if one was asked for.
+         *
+         * Here rather than in the caller because this is the only thread that
+         * may touch the decoder, and between blocks rather than mid-write so
+         * the sink never receives half of one position and half of another.
+         */
+        pthread_mutex_lock(&p->lock);
+        if (p->req_seek) {
+            unsigned long want = p->req_seek_ms;
+            long landed;
+
+            p->req_seek = 0;
+            pthread_mutex_unlock(&p->lock);
+
+            landed = tp_dec_seek_ms(dec, want);
+            if (landed >= 0) {
+                /*
+                 * The clock is derived from samples played, so it has to be
+                 * moved with the file - otherwise the progress bar carries on
+                 * from where it was and disagrees with what you can hear.
+                 */
+                pthread_mutex_lock(&p->lock);
+                p->played_samples =
+                    (unsigned long long)((double)landed / 1000.0
+                                         * p->rate * p->channels);
+                pthread_mutex_unlock(&p->lock);
+
+                /* What is already queued in the device belongs to the old
+                   position and would play before the new one. */
+                tp_sink_flush(sink);
+            }
+        } else {
+            pthread_mutex_unlock(&p->lock);
         }
 
         n = tp_dec_read(dec, block);
@@ -356,6 +398,39 @@ static unsigned long long playing_ms_locked(const struct tp_player *p)
     if (ns <= paused)
         return 0;
     return (ns - paused) / 1000000ull;
+}
+
+int tp_player_can_seek(struct tp_player *p)
+{
+    int ok;
+
+    if (!p)
+        return 0;
+    pthread_mutex_lock(&p->lock);
+    ok = p->can_seek && p->thread_live && !p->done;
+    pthread_mutex_unlock(&p->lock);
+    return ok;
+}
+
+int tp_player_seek_ms(struct tp_player *p, unsigned long ms)
+{
+    int ok;
+
+    if (!p)
+        return -1;
+
+    pthread_mutex_lock(&p->lock);
+    ok = p->can_seek && p->thread_live && !p->done;
+    if (ok) {
+        p->req_seek = 1;
+        p->req_seek_ms = ms;
+        /* A paused player is waiting on this; wake it so the seek is not
+           held until somebody presses play. */
+        pthread_cond_broadcast(&p->cond);
+    }
+    pthread_mutex_unlock(&p->lock);
+
+    return ok ? 0 : -1;
 }
 
 unsigned long tp_player_position_ms(struct tp_player *p)
