@@ -7,6 +7,8 @@
 #include "tp_log.h"
 #include "tp_sink.h"
 #include "tp_browse.h"
+#include "tp_app.h"
+#include "tp_player.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -686,6 +688,148 @@ static void test_io_err_record(void)
     EXPECT(strstr(line, "I/O error") == NULL);
 }
 
+/* ---- the queue, as a person drives it ------------------------------------ */
+
+/*
+ * A folder of files to play, on the real filesystem.
+ *
+ * Real files rather than a stub browser: tp_queue_from_folder goes through
+ * tp_browse_open, which reads a directory and decides what is playable, and a
+ * fake in front of that would test the fake. The contents do not have to
+ * decode - nothing here reaches a decoder - but they have to exist, because
+ * that is precisely what the failure path checks.
+ */
+static void make_folder(const char *dir, int n)
+{
+    int i;
+
+    mkdir(dir, 0755);
+    for (i = 1; i <= n; i++) {
+        char path[512];
+        FILE *f;
+
+        snprintf(path, sizeof path, "%s/%02d track.mp3", dir, i);
+        if ((f = fopen(path, "wb")) != NULL) {
+            fwrite("not really an mp3", 1, 17, f);
+            fclose(f);
+        }
+    }
+}
+
+static const char *queue_now(struct tp_app *app)
+{
+    const struct tp_queue_item *it = tp_queue_current(&app->queue);
+
+    return it && it->path ? it->path : "";
+}
+
+/* Which track number the queue is sitting on, from the name we gave it. */
+static int queue_track_no(struct tp_app *app)
+{
+    const char *p = queue_now(app);
+    const char *slash = strrchr(p, '/');
+
+    if (!slash) return -1;
+    return atoi(slash + 1);
+}
+
+/*
+ * The three faults reported from the device, each as the sequence of presses
+ * that produces it.
+ *
+ * There is no volume and no iTunes database here, which is the point: a folder
+ * queue needs neither, and the reported faults all appear when the database is
+ * absent or unreadable - which on this device it frequently is.
+ */
+static void test_queue_folder_playback(void)
+{
+    const char *dir = "/tmp/tp_queue_test";
+    struct tp_app app;
+    char first[512];
+
+    make_folder(dir, 5);
+    snprintf(first, sizeof first, "%s/01 track.mp3", dir);
+
+    /* No volume is a state this app is expected to carry on through. */
+    tp_app_init(&app, "/nonexistent", TP_PLAYER_NULL);
+
+    /* Pin what this test depends on. The config is read from disk and carries
+       whatever the last real session left there, so a saved shuffle would put
+       the folder in an order this test cannot predict. */
+    app.cfg.shuffle = 0;
+    app.queue.repeat = TP_REPEAT_OFF;
+
+    /* Fault 3: playing a file builds a queue of its whole folder. */
+    EXPECT(tp_app_cmd_play_file(&app, first) == 0);
+    EXPECT(app.queue.count == 5);
+    EXPECT(queue_track_no(&app) == 1);
+
+    /*
+     * Fault 1: the next track has to start on its own.
+     *
+     * advance() is what the interface calls when a track ends. It refuses
+     * unless app->loaded is set, and app->loaded is set only by a successful
+     * iTunes database parse - which a folder queue neither has nor needs.
+     */
+    EXPECT(tp_app_cmd_advance(&app) == 0);
+    EXPECT(queue_track_no(&app) == 2);
+
+    /* And Next and Previous, which are gated the same way. */
+    EXPECT(tp_app_cmd_next(&app) == 0);
+    EXPECT(queue_track_no(&app) == 3);
+    EXPECT(tp_app_cmd_prev(&app) == 0);
+    EXPECT(queue_track_no(&app) == 2);
+
+    tp_app_free(&app);
+}
+
+/*
+ * Fault 2: a file that will not open must not move the queue twice.
+ *
+ * The volume this runs on returns read errors, so a track failing to open is
+ * an ordinary event rather than an exotic one. Deleting a file out from under
+ * a built queue is the same thing from the player's point of view, and it is
+ * the only way to produce it deterministically.
+ */
+static void test_queue_survives_a_bad_file(void)
+{
+    const char *dir = "/tmp/tp_queue_bad";
+    struct tp_app app;
+    char first[512], third[512];
+    int before;
+
+    make_folder(dir, 5);
+    snprintf(first, sizeof first, "%s/01 track.mp3", dir);
+    snprintf(third, sizeof third, "%s/03 track.mp3", dir);
+
+    tp_app_init(&app, "/nonexistent", TP_PLAYER_NULL);
+    app.cfg.shuffle = 0;
+    app.queue.repeat = TP_REPEAT_OFF;
+    EXPECT(tp_app_cmd_play_file(&app, first) == 0);
+    EXPECT(app.queue.count == 5);
+
+    /* Track three is now unreadable, exactly as the FTL makes them. */
+    unlink(third);
+
+    /* Two forward: onto two, then onto the broken three. */
+    EXPECT(tp_app_cmd_next(&app) == 0);
+    before = queue_track_no(&app);
+    EXPECT(before == 2);
+
+    /*
+     * Next onto a file that will not open. Whatever the result, the queue may
+     * not end up further than the next playable track - a failure that also
+     * advances puts it two on, which is the reported "next skips two".
+     */
+    tp_app_cmd_next(&app);
+    EXPECT(queue_track_no(&app) == 3 || queue_track_no(&app) == 4);
+
+    /* And the queue is still usable afterwards, not wedged. */
+    EXPECT(app.queue.count == 5);
+
+    tp_app_free(&app);
+}
+
 int main(void)
 {
     tp_log_set_level(TP_LOG_ERROR);
@@ -708,6 +852,8 @@ int main(void)
     test_mount_plain_music_folder_is_not_a_volume();
     test_mount_bad_cli_falls_through();
     test_sink_resample();
+    test_queue_folder_playback();
+    test_queue_survives_a_bad_file();
     if (g_fail) {
         fprintf(stderr, "%d test(s) failed\n", g_fail);
         return 1;

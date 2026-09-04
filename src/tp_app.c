@@ -441,6 +441,37 @@ int tp_app_cmd_resume(struct tp_app *app)
 }
 
 /*
+ * Nothing queued and nothing said about what to queue: fall back to the
+ * library, loading it if that has not happened yet.
+ *
+ * This is the ONLY place playback is allowed to care whether the database
+ * loaded. Next, Previous and advance each used to open with
+ *
+ *     if (!app->loaded && tp_app_load(app) != 0) return 1;
+ *
+ * which meant a folder queue - built, in memory, needing no database at all -
+ * could not be moved through on a device whose iTunes database was missing or
+ * unreadable. On this hardware that is not a corner case: the database sits on
+ * the volume that returns read errors, so the common failure took the
+ * transport controls down with it.
+ */
+static int fall_back_to_library(struct tp_app *app)
+{
+    if (!app->loaded && tp_app_load(app) != 0)
+        return -1;
+    return tp_queue_from_library(&app->queue, &app->lib, app->cfg.shuffle);
+}
+
+/*
+ * How far into a track Previous stops meaning "the one before".
+ *
+ * Every player anyone has used restarts the current track when you are a few
+ * seconds in, and it is the behaviour that makes a mis-press recoverable:
+ * pressing Previous once during a song you are enjoying should not lose it.
+ */
+#define TP_PREV_RESTART_MS 3000
+
+/*
  * Next, as the button means it.
  *
  * Returns 1 at the end of a queue with repeat off - the caller stops rather
@@ -448,10 +479,7 @@ int tp_app_cmd_resume(struct tp_app *app)
  */
 int tp_app_cmd_next(struct tp_app *app)
 {
-    if (!app->loaded && tp_app_load(app) != 0)
-        return 1;
-    if (app->queue.count == 0 &&
-        tp_queue_from_library(&app->queue, &app->lib, app->cfg.shuffle) != 0)
+    if (app->queue.count == 0 && fall_back_to_library(app) != 0)
         return 1;
     if (tp_queue_skip_next(&app->queue) != 0)
         return 1;
@@ -461,7 +489,10 @@ int tp_app_cmd_next(struct tp_app *app)
 /* Next, as a track ENDING means it - this is the one Repeat One acts on. */
 int tp_app_cmd_advance(struct tp_app *app)
 {
-    if (!app->loaded || app->queue.count == 0)
+    /* No library fallback here on purpose. A track ending is not a request to
+       start playing the whole device; if there is no queue there is nothing
+       this was continuing. */
+    if (app->queue.count == 0)
         return 1;
     if (tp_queue_next(&app->queue) != 0)
         return 1;
@@ -470,11 +501,13 @@ int tp_app_cmd_advance(struct tp_app *app)
 
 int tp_app_cmd_prev(struct tp_app *app)
 {
-    if (!app->loaded && tp_app_load(app) != 0)
+    if (app->queue.count == 0 && fall_back_to_library(app) != 0)
         return 1;
-    if (app->queue.count == 0 &&
-        tp_queue_from_library(&app->queue, &app->lib, app->cfg.shuffle) != 0)
-        return 1;
+
+    /* Far enough in that you meant "again", not "the one before". */
+    if (tp_player_position_ms(app->player) >= TP_PREV_RESTART_MS)
+        return tp_app_play_current(app);
+
     if (tp_queue_prev(&app->queue) != 0)
         return 1;
     return tp_app_play_current(app);
