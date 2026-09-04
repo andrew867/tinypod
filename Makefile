@@ -186,7 +186,7 @@ ifeq ($(TARGET),n31)
   # softfp is the ABI, not the arithmetic: FP instructions are generated and
   # arguments are passed in integer registers, which is what this eabi (not
   # eabihf) toolchain wants. The same flags every other app here uses.
-  ARCH := -mcpu=cortex-a8 -mfpu=vfpv3-d16 -mfloat-abi=softfp
+  ARCH := -mcpu=cortex-a5 -mfpu=vfpv4 -mfloat-abi=softfp
   CFLAGS := -Os $(ARCH) -static $(WARN) $(INCLUDES) $(CDEFS) -DTINYPOD_N31
   DECFLAGS := -O2 $(ARCH) -DARM $(INCLUDES) $(CDEFS)
   LDFLAGS := -static $(TINYALSA_LIB) $(LVGL_LIB) $(FFMPEG_LIBS) $(SOXR_LIB) -lpthread -ldl -lm
