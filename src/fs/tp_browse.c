@@ -115,6 +115,29 @@ int tp_browse_parent(char *out, size_t cap, const char *path)
  * case. readdir gives whatever order the filesystem feels like, which on
  * vfat is roughly creation order - fine for a machine and useless to read.
  */
+static char lower(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+}
+
+static int digit(char c)
+{
+    return c >= '0' && c <= '9';
+}
+
+/*
+ * Name order, with runs of digits compared as numbers.
+ *
+ * Character by character puts "Track 10" before "Track 2", which was always
+ * wrong on screen and is worse now that the folder IS the running order -
+ * an album played from the browser would go 1, 10, 11, 2. So a run of digits
+ * on both sides is compared by value: shorter number first, and on equal
+ * length the first differing digit decides.
+ *
+ * Leading zeros are skipped before the lengths are compared, so "02" and "2"
+ * are the same track number, which is what the two naming conventions for the
+ * same album mean by them.
+ */
 static int cmp_entry(const void *pa, const void *pb)
 {
     const struct tp_browse_entry *a = pa, *b = pb;
@@ -123,12 +146,43 @@ static int cmp_entry(const void *pa, const void *pb)
     if (a->is_dir != b->is_dir)
         return a->is_dir ? -1 : 1;
 
-    for (x = a->name, y = b->name; *x && *y; x++, y++) {
-        char ca = *x, cb = *y;
-        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
-        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
-        if (ca != cb) return ca < cb ? -1 : 1;
+    x = a->name;
+    y = b->name;
+
+    while (*x && *y) {
+        if (digit(*x) && digit(*y)) {
+            const char *sx, *sy;
+            size_t nx, ny;
+
+            while (*x == '0') x++;
+            while (*y == '0') y++;
+
+            sx = x;
+            sy = y;
+            while (digit(*x)) x++;
+            while (digit(*y)) y++;
+
+            nx = (size_t)(x - sx);
+            ny = (size_t)(y - sy);
+            if (nx != ny)
+                return nx < ny ? -1 : 1;
+
+            for (; sx < x; sx++, sy++)
+                if (*sx != *sy)
+                    return *sx < *sy ? -1 : 1;
+            continue;
+        }
+
+        {
+            char ca = lower(*x), cb = lower(*y);
+
+            if (ca != cb)
+                return ca < cb ? -1 : 1;
+        }
+        x++;
+        y++;
     }
+
     if (*x) return 1;
     if (*y) return -1;
     return 0;
