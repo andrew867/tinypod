@@ -1535,7 +1535,20 @@ static void on_key(enum tp_lv_key k)
      * so the two gestures come apart without needing a fifth button.
      */
     if (v->kind == V_NOW && (k == TP_LV_UP || k == TP_LV_DOWN)) {
-        int dir = (k == TP_LV_UP) ? -1 : 1;
+        /*
+         * Volume up is forwards.
+         *
+         * This was the other way round, on the reasoning that a list moves its
+         * highlight UP towards earlier entries and the queue should match. It
+         * reads as backwards in the hand: the two keys are on the side of a
+         * music player, and the upper one is expected to go on to the next
+         * track rather than back to the last. Holding follows the same sense,
+         * so up scrubs forwards through the track as well.
+         *
+         * The list handler below keeps the other sense on purpose - there, up
+         * really does mean towards the top of the list.
+         */
+        int dir = (k == TP_LV_UP) ? 1 : -1;
         int held = scroll_step(dir) > 1 || s_ui.scroll_run >= 1;
 
         if (held && tp_player_can_seek(app->player)) {
