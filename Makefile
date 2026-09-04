@@ -30,6 +30,7 @@ SRC_APP := \
 	src/util/tp_io.c \
 	src/util/tp_util.c \
 	src/util/tp_config.c \
+	src/util/tp_volume.c \
 	src/fs/tp_browse.c \
 	src/fs/tp_mount_detect.c \
 	src/fs/tp_path_resolve.c \

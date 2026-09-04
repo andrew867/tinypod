@@ -1,19 +1,21 @@
 /*
- * tp_lv_input.h — three buttons, and what they have to cover.
+ * tp_lv_input.h — four buttons, and what they have to cover.
  *
- * The device has volume up, volume down, play/pause and home down one side, and
- * no touchscreen. HOME is not available to this app: the N31 launcher watches
- * for it and terminates whatever is running, which is how you get back to the
- * launcher from any app. Taking it here would break that, so HOME is left
- * alone and TinyPod has three buttons, not four.
+ * The device has volume up, volume down, play/pause and home down one side,
+ * and no touchscreen.
  *
- * Three buttons have to cover navigating a library AND transport controls, so
- * PLAY is doubled up by duration:
- *
- *   VOL +/-      move the selection; on Now Playing, previous/next track
+ *   VOL +/-      move the selection; on Now Playing, previous/next track;
+ *                the value, while a setting is being adjusted
  *   PLAY short   select, or play/pause on Now Playing
  *   PLAY long    back, one level at a time
- *   HOME         exits to the launcher (not seen here)
+ *   HOME         back, and from the top screen, leave
+ *
+ * HOME used to belong to the launcher, which watched for it and terminated
+ * whatever was running. That cost every app its fourth button, and made
+ * quitting indistinguishable from being killed - no chance to write a config
+ * or stop a sink cleanly. Buttons now stay with the app that is running; the
+ * launcher uses the Sleep button to get out of an app that does not handle
+ * HOME itself, and an app says which it is in its app.json.
  *
  * Long-press is on PLAY rather than on a volume key because holding a volume
  * key is how you scroll a long list, and the two would fight.
@@ -28,6 +30,7 @@ enum tp_lv_key {
     TP_LV_DOWN,
     TP_LV_SELECT,     /* PLAY, released before the long-press threshold */
     TP_LV_BACK,       /* PLAY, held past it */
+    TP_LV_HOME,       /* HOME: back, or leave from the top */
     TP_LV_QUIT
 };
 

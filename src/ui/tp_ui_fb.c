@@ -343,9 +343,8 @@ static void activate(struct ui_state *ui)
         switch (ui->sel) {
         case 0:
             ui->app->cfg.shuffle = 1;
-            tp_queue_from_library(&ui->app->queue, &ui->app->lib, 1);
-            if (ui->app->queue.count &&
-                tp_app_cmd_play_id(ui->app, ui->app->queue.ids[0]) == 0)
+            if (tp_queue_from_library(&ui->app->queue, &ui->app->lib, 1) == 0 &&
+                tp_app_play_current(ui->app) == 0)
                 ui->was_playing = 1;
             ui->screen = UI_NOW;
             break;

@@ -1,4 +1,5 @@
 #include "tp_app.h"
+#include "fs/tp_browse.h"
 #include "util/tp_diag.h"
 #include "tp_decode.h"
 #include "tp_sink.h"
@@ -20,6 +21,14 @@ int tp_app_init(struct tp_app *app, const char *mount, enum tp_player_backend ba
     tp_queue_init(&app->queue);
     tp_config_init(&app->cfg);
     tp_config_load(&app->cfg);
+    /* The queue is what acts on repeat, so it has to be told at startup and
+       not only when the settings screen is opened. */
+    if (!strcmp(app->cfg.repeat, "one"))
+        app->queue.repeat = TP_REPEAT_ONE;
+    else if (!strcmp(app->cfg.repeat, "all"))
+        app->queue.repeat = TP_REPEAT_ALL;
+    else
+        app->queue.repeat = TP_REPEAT_OFF;
     app->player = tp_player_create(backend);
     if (!app->player)
         return -1;
@@ -333,6 +342,30 @@ int tp_app_cmd_export_m3u(struct tp_app *app, FILE *out)
     return 0;
 }
 
+/*
+ * Play what the queue is pointing at.
+ *
+ * A library track goes through play_track so it gets its metadata; anything
+ * else is a path and goes straight to the file. Everything that moves through
+ * the queue comes here, so there is one place that knows the difference.
+ */
+int tp_app_play_current(struct tp_app *app)
+{
+    const struct tp_queue_item *it = tp_queue_current(&app->queue);
+    struct tp_track *t;
+
+    if (!it)
+        return 1;
+
+    if (it->id && (t = tp_library_find_track(&app->lib, it->id)) != NULL) {
+        app->cfg.last_track_id = t->track_id;
+        tp_config_save(&app->cfg);
+        return tp_player_play_track(app->player, t) == 0 ? 0 : 1;
+    }
+
+    return tp_player_play_file(app->player, it->path) == 0 ? 0 : 1;
+}
+
 int tp_app_cmd_play_id(struct tp_app *app, uint64_t id)
 {
     struct tp_track *t;
@@ -353,16 +386,43 @@ int tp_app_cmd_play_id(struct tp_app *app, uint64_t id)
         tp_error("No track with id %llu", (unsigned long long)id);
         return 1;
     }
-    app->cfg.last_track_id = t->track_id;
-    tp_config_save(&app->cfg);
-    if (app->queue.count == 0)
+    /*
+     * Already in the queue: move to it and keep the context. Only build a new
+     * queue when it is not, because rebuilding on every play is what made
+     * choosing a track inside an album drop you back into the whole library.
+     */
+    if (tp_queue_seek_id(&app->queue, id) != 0) {
         tp_queue_from_library(&app->queue, &app->lib, app->cfg.shuffle);
-    return tp_player_play_track(app->player, t) == 0 ? 0 : 1;
+        tp_queue_seek_id(&app->queue, id);
+    }
+    return tp_app_play_current(app);
 }
 
 int tp_app_cmd_play_file(struct tp_app *app, const char *path)
 {
-    return tp_player_play_file(app->player, path) == 0 ? 0 : 1;
+    char folder[TP_BROWSE_PATH_MAX];
+
+    if (!path)
+        return 1;
+
+    /*
+     * A file picked in the browser queues its whole folder.
+     *
+     * Which is what picking a track in a folder of music means - the album
+     * carries on. It used to play the one file and leave whatever queue was
+     * there, so the next track came from a shuffle of the entire library.
+     *
+     * The folder is the queue even with shuffle on; shuffle decides the order
+     * within it, and the file that was picked still plays first.
+     */
+    if (tp_browse_parent(folder, sizeof folder, path) != 0 ||
+        tp_queue_from_folder(&app->queue, &app->lib, folder, path,
+                             app->cfg.shuffle) != 0) {
+        if (tp_queue_from_file(&app->queue, &app->lib, path) != 0)
+            return tp_player_play_file(app->player, path) == 0 ? 0 : 1;
+    }
+
+    return tp_app_play_current(app);
 }
 
 int tp_app_cmd_stop(struct tp_app *app)
@@ -380,24 +440,44 @@ int tp_app_cmd_resume(struct tp_app *app)
     return tp_player_resume(app->player) == 0 ? 0 : 1;
 }
 
+/*
+ * Next, as the button means it.
+ *
+ * Returns 1 at the end of a queue with repeat off - the caller stops rather
+ * than wrapping, which is the whole difference between Repeat All and Off.
+ */
 int tp_app_cmd_next(struct tp_app *app)
 {
     if (!app->loaded && tp_app_load(app) != 0)
         return 1;
-    if (app->queue.count == 0)
-        tp_queue_from_library(&app->queue, &app->lib, app->cfg.shuffle);
-    tp_queue_next(&app->queue);
-    return tp_app_cmd_play_id(app, app->queue.ids[app->queue.pos]);
+    if (app->queue.count == 0 &&
+        tp_queue_from_library(&app->queue, &app->lib, app->cfg.shuffle) != 0)
+        return 1;
+    if (tp_queue_skip_next(&app->queue) != 0)
+        return 1;
+    return tp_app_play_current(app);
+}
+
+/* Next, as a track ENDING means it - this is the one Repeat One acts on. */
+int tp_app_cmd_advance(struct tp_app *app)
+{
+    if (!app->loaded || app->queue.count == 0)
+        return 1;
+    if (tp_queue_next(&app->queue) != 0)
+        return 1;
+    return tp_app_play_current(app);
 }
 
 int tp_app_cmd_prev(struct tp_app *app)
 {
     if (!app->loaded && tp_app_load(app) != 0)
         return 1;
-    if (app->queue.count == 0)
-        tp_queue_from_library(&app->queue, &app->lib, app->cfg.shuffle);
-    tp_queue_prev(&app->queue);
-    return tp_app_cmd_play_id(app, app->queue.ids[app->queue.pos]);
+    if (app->queue.count == 0 &&
+        tp_queue_from_library(&app->queue, &app->lib, app->cfg.shuffle) != 0)
+        return 1;
+    if (tp_queue_prev(&app->queue) != 0)
+        return 1;
+    return tp_app_play_current(app);
 }
 
 int tp_app_cmd_shuffle(struct tp_app *app)

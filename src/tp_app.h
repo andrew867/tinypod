@@ -50,7 +50,11 @@ int tp_app_cmd_play_file(struct tp_app *app, const char *path);
 int tp_app_cmd_stop(struct tp_app *app);
 int tp_app_cmd_pause(struct tp_app *app);
 int tp_app_cmd_resume(struct tp_app *app);
+int tp_app_play_current(struct tp_app *app);
 int tp_app_cmd_next(struct tp_app *app);
+/* Next because a track ended, not because Next was pressed - the difference
+   is Repeat One, which repeats on the first and skips on the second. */
+int tp_app_cmd_advance(struct tp_app *app);
 int tp_app_cmd_prev(struct tp_app *app);
 int tp_app_cmd_shuffle(struct tp_app *app);
 int tp_app_cmd_status(struct tp_app *app);

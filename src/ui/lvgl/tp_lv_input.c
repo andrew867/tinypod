@@ -17,6 +17,8 @@
 #define KEY_VOLUMEDOWN 114
 #define KEY_VOLUMEUP   115
 #define KEY_PLAYPAUSE  164
+/* gpio-d1830 reports the Home button as KEY_HOMEPAGE. */
+#define KEY_HOMEPAGE   172
 
 /* Long enough that a normal press is never mistaken for it, short enough that
    holding for it does not feel like waiting. */
@@ -122,6 +124,19 @@ enum tp_lv_key tp_lv_input_poll(void)
                     if (was)
                         return TP_LV_SELECT;
                 }
+                continue;
+            }
+
+            /*
+             * HOME on the press, and never on auto-repeat.
+             *
+             * It pops a screen and can leave the app, so a held button must
+             * not run up the stack and out of the program while a thumb rests
+             * on it.
+             */
+            if (ev.code == KEY_HOMEPAGE) {
+                if (ev.value == 1)
+                    return TP_LV_HOME;
                 continue;
             }
 

@@ -10,6 +10,7 @@
  * same pause/resume/stop calls, so the UI does not know the difference.
  */
 #include "tp_player.h"
+#include "../fs/tp_browse.h"
 #include "tp_decode.h"
 #include "tp_sink.h"
 #include "tp_util.h"
@@ -586,6 +587,33 @@ int tp_player_play_file(struct tp_player *p, const char *path)
 
     if (!p || !path)
         return -1;
+
+    /*
+     * Whose track this is, before anything else.
+     *
+     * play_track sets the title from the library and then calls this; calling
+     * this directly - which is what the folder browser does - used to leave
+     * the PREVIOUS track's title in place, so Now Playing confidently named
+     * something that was not playing. Clear it here, so the worst case is the
+     * file name rather than a wrong answer. play_track fills it in again
+     * after, because it knows better.
+     */
+    free(p->current_title);
+    p->current_title = NULL;
+    {
+        const char *base = strrchr(path, '/');
+        const char *dot;
+        size_t n;
+
+        base = base ? base + 1 : path;
+        dot = strrchr(base, '.');
+        n = (dot && dot != base) ? (size_t)(dot - base) : strlen(base);
+        p->current_title = malloc(n + 1);
+        if (p->current_title) {
+            memcpy(p->current_title, base, n);
+            p->current_title[n] = '\0';
+        }
+    }
     if (!tp_is_readable_file(path)) {
         tp_error("Could not find the audio file for this track.\nResolved path:\n  %s", path);
         return -1;
@@ -655,17 +683,23 @@ int tp_player_play_track(struct tp_player *p, const struct tp_track *t)
         return play_null(p, t->absolute_path, title);
     }
 
-    free(p->current_title);
-    p->current_title = NULL;
-    if (t->title) {
-        char title[512];
-        snprintf(title, sizeof(title), "%s - %s", t->artist ? t->artist : "?", t->title);
-        p->current_title = tp_strdup(title);
-    }
-
     tp_info("Now playing:\n  %s - %s\n  %s\n  %s", t->artist ? t->artist : "?",
             t->title ? t->title : "?", t->album ? t->album : "", t->absolute_path);
-    return tp_player_play_file(p, t->absolute_path);
+
+    if (tp_player_play_file(p, t->absolute_path) != 0)
+        return -1;
+
+    /* After, not before: play_file resets the title to the file name, which
+       is the right answer only when there is nothing better. There is. */
+    if (t->title) {
+        char title[512];
+
+        snprintf(title, sizeof(title), "%s - %s",
+                 t->artist ? t->artist : "?", t->title);
+        free(p->current_title);
+        p->current_title = tp_strdup(title);
+    }
+    return 0;
 }
 
 int tp_player_pause(struct tp_player *p)
@@ -760,48 +794,383 @@ void tp_queue_init(struct tp_play_queue *q)
 
 void tp_queue_free(struct tp_play_queue *q)
 {
-    free(q->ids);
+    size_t i;
+
+    for (i = 0; i < q->count; i++) {
+        free(q->items[i].path);
+        free(q->items[i].title);
+    }
+    free(q->items);
+    free(q->order);
     memset(q, 0, sizeof(*q));
+}
+
+const struct tp_queue_item *tp_queue_current(const struct tp_play_queue *q)
+{
+    if (!q || !q->count || q->pos >= q->count)
+        return NULL;
+    return &q->items[q->order[q->pos]];
+}
+
+size_t tp_queue_index(const struct tp_play_queue *q)
+{
+    return (q && q->count) ? q->pos + 1 : 0;
+}
+
+/* ---- building ------------------------------------------------------------ */
+
+/* Room for n items and an order to go with them, both zeroed. */
+static int queue_alloc(struct tp_play_queue *q, size_t n)
+{
+    tp_queue_free(q);
+    if (!n)
+        return -1;
+
+    q->items = calloc(n, sizeof(*q->items));
+    q->order = calloc(n, sizeof(*q->order));
+    if (!q->items || !q->order) {
+        free(q->items);
+        free(q->order);
+        q->items = NULL;
+        q->order = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+/* order[] as it stands, then Fisher-Yates over it. */
+static void order_identity(struct tp_play_queue *q)
+{
+    size_t i;
+
+    for (i = 0; i < q->count; i++)
+        q->order[i] = i;
+}
+
+static void order_shuffle(struct tp_play_queue *q)
+{
+    size_t i;
+
+    order_identity(q);
+    for (i = q->count; i > 1; i--) {
+        size_t j = (size_t)(rand() % (int)i);
+        size_t t = q->order[i - 1];
+
+        q->order[i - 1] = q->order[j];
+        q->order[j] = t;
+    }
+}
+
+/* Put the running order at whichever slot plays item `want`. */
+static void seek_to_item(struct tp_play_queue *q, size_t want)
+{
+    size_t i;
+
+    for (i = 0; i < q->count; i++) {
+        if (q->order[i] == want) {
+            q->pos = i;
+            return;
+        }
+    }
+    q->pos = 0;
+}
+
+void tp_queue_set_shuffle(struct tp_play_queue *q, int shuffle)
+{
+    size_t playing;
+
+    if (!q || !q->count || !!q->shuffle == !!shuffle)
+        return;
+
+    playing = q->order[q->pos];
+    q->shuffle = shuffle ? 1 : 0;
+
+    if (shuffle)
+        order_shuffle(q);
+    else
+        order_identity(q);
+
+    seek_to_item(q, playing);
 }
 
 int tp_queue_from_library(struct tp_play_queue *q, struct tp_library *lib, int shuffle)
 {
     size_t i;
 
-    tp_queue_free(q);
-    if (!lib->track_count)
+    if (!lib->track_count || queue_alloc(q, lib->track_count) != 0)
         return -1;
-    q->ids = calloc(lib->track_count, sizeof(uint64_t));
-    if (!q->ids)
-        return -1;
-    q->count = lib->track_count;
-    for (i = 0; i < lib->track_count; i++)
-        q->ids[i] = lib->tracks[i].track_id;
-    q->shuffle = shuffle;
-    if (shuffle) {
-        for (i = q->count - 1; i > 0; i--) {
-            size_t j = (size_t)(rand() % (int)(i + 1));
-            uint64_t tmp = q->ids[i];
-            q->ids[i] = q->ids[j];
-            q->ids[j] = tmp;
-        }
+
+    for (i = 0; i < lib->track_count; i++) {
+        q->items[i].id = lib->tracks[i].track_id;
+        q->items[i].path = tp_strdup(lib->tracks[i].absolute_path);
     }
+    q->count = lib->track_count;
+    q->shuffle = shuffle ? 1 : 0;
+
+    if (shuffle)
+        order_shuffle(q);
+    else
+        order_identity(q);
+
     q->pos = 0;
     return 0;
+}
+
+int tp_queue_from_indices(struct tp_play_queue *q, struct tp_library *lib,
+                          const size_t *idx, size_t n, size_t start,
+                          int shuffle)
+{
+    size_t i, start_at = 0;
+
+    if (!lib || !idx || !n || queue_alloc(q, n) != 0)
+        return -1;
+
+    {
+        size_t k = 0;
+
+        /* Packed, not indexed by i: an index the library does not have would
+           otherwise leave an item with no path in the middle of the album,
+           which plays as a failure and looks like a corrupt file. */
+        for (i = 0; i < n; i++) {
+            if (idx[i] >= lib->track_count)
+                continue;
+            q->items[k].id = lib->tracks[idx[i]].track_id;
+            q->items[k].path = tp_strdup(lib->tracks[idx[i]].absolute_path);
+            if (idx[i] == start)
+                start_at = k;
+            k++;
+        }
+        q->count = k;
+    }
+
+    if (!q->count) {
+        tp_queue_free(q);
+        return -1;
+    }
+    q->shuffle = shuffle ? 1 : 0;
+
+    if (shuffle)
+        order_shuffle(q);
+    else
+        order_identity(q);
+
+    /* On the track that was picked, wherever shuffle put it. */
+    seek_to_item(q, start_at);
+    return 0;
+}
+
+int tp_queue_seek_id(struct tp_play_queue *q, uint64_t id)
+{
+    size_t i;
+
+    if (!q || !q->count || !id)
+        return -1;
+
+    for (i = 0; i < q->count; i++) {
+        if (q->items[i].id == id) {
+            seek_to_item(q, i);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/*
+ * The library entry for a file, matched on the path it resolved to.
+ *
+ * A folder of music that IS in the database should still show its titles and
+ * artists rather than file names, and the browser is a perfectly ordinary way
+ * to reach it.
+ */
+static const struct tp_track *track_for_path(struct tp_library *lib,
+                                             const char *path)
+{
+    size_t i;
+
+    if (!lib || !path)
+        return NULL;
+
+    for (i = 0; i < lib->track_count; i++) {
+        const char *ap = lib->tracks[i].absolute_path;
+
+        if (ap && !strcmp(ap, path))
+            return &lib->tracks[i];
+    }
+    return NULL;
+}
+
+/* The file name, with its extension taken off, as a last-resort title. */
+static char *title_from_path(const char *path)
+{
+    const char *base = strrchr(path, '/');
+    const char *dot;
+    char *out;
+    size_t n;
+
+    base = base ? base + 1 : path;
+    dot = strrchr(base, '.');
+    n = dot && dot != base ? (size_t)(dot - base) : strlen(base);
+
+    out = malloc(n + 1);
+    if (!out)
+        return NULL;
+    memcpy(out, base, n);
+    out[n] = '\0';
+    return out;
+}
+
+/* Fill one item in, taking the library's word for it where there is one. */
+static void item_set(struct tp_queue_item *it, struct tp_library *lib,
+                     const char *path)
+{
+    const struct tp_track *t = track_for_path(lib, path);
+
+    it->path = tp_strdup(path);
+    if (t) {
+        it->id = t->track_id;
+        it->title = NULL;        /* the library has a better one */
+    } else {
+        it->id = 0;
+        it->title = title_from_path(path);
+    }
+}
+
+int tp_queue_from_file(struct tp_play_queue *q, struct tp_library *lib,
+                       const char *path)
+{
+    if (!path || queue_alloc(q, 1) != 0)
+        return -1;
+
+    item_set(&q->items[0], lib, path);
+    q->count = 1;
+    q->shuffle = 0;
+    order_identity(q);
+    q->pos = 0;
+    return 0;
+}
+
+int tp_queue_from_folder(struct tp_play_queue *q, struct tp_library *lib,
+                         const char *folder, const char *start, int shuffle)
+{
+    struct tp_browse b;
+    size_t i, n = 0, start_at = 0;
+
+    if (!folder)
+        return -1;
+
+    /* Not show_hidden: a queue is not a listing, and a dot file that plays is
+       still something nobody asked to hear. */
+    if (tp_browse_open(&b, folder, 0, NULL, 0) != 0)
+        return -1;
+
+    for (i = 0; i < b.count; i++)
+        if (!b.entries[i].is_dir && b.entries[i].playable)
+            n++;
+
+    if (!n || queue_alloc(q, n) != 0) {
+        tp_browse_free(&b);
+        return -1;
+    }
+
+    n = 0;
+    for (i = 0; i < b.count; i++) {
+        char path[TP_BROWSE_PATH_MAX];
+
+        if (b.entries[i].is_dir || !b.entries[i].playable)
+            continue;
+        if (tp_browse_join(path, sizeof path, folder, b.entries[i].name) != 0)
+            continue;
+
+        item_set(&q->items[n], lib, path);
+        if (start && !strcmp(path, start))
+            start_at = n;
+        n++;
+    }
+
+    q->count = n;
+    tp_browse_free(&b);
+
+    if (!q->count) {
+        tp_queue_free(q);
+        return -1;
+    }
+
+    q->shuffle = shuffle ? 1 : 0;
+    if (shuffle)
+        order_shuffle(q);
+    else
+        order_identity(q);
+
+    /*
+     * Start on the file that was picked, wherever shuffle put it. Playing
+     * something else because shuffle was on is not what picking a file means.
+     */
+    seek_to_item(q, start_at);
+    return 0;
+}
+
+/* ---- moving -------------------------------------------------------------- */
+
+/* One forward, wrapping only when repeat says to. */
+static int advance(struct tp_play_queue *q)
+{
+    if (q->pos + 1 < q->count) {
+        q->pos++;
+        return 0;
+    }
+    if (q->repeat == TP_REPEAT_ALL) {
+        q->pos = 0;
+        return 0;
+    }
+    return -1;
 }
 
 int tp_queue_next(struct tp_play_queue *q)
 {
     if (!q || !q->count)
         return -1;
-    q->pos = (q->pos + 1) % q->count;
-    return 0;
+
+    /* Repeat One is about what happens when a track ENDS, which is the only
+       time this is reached without the button having been pressed. */
+    if (q->repeat == TP_REPEAT_ONE)
+        return 0;
+
+    return advance(q);
+}
+
+int tp_queue_skip_next(struct tp_play_queue *q)
+{
+    if (!q || !q->count)
+        return -1;
+
+    /*
+     * The button always moves. With Repeat One the alternative is a Next that
+     * plays the same track again, which reads as a broken button rather than
+     * as a setting - and there is a way to hear the track again already.
+     */
+    if (q->repeat == TP_REPEAT_ONE && q->count > 1) {
+        if (q->pos + 1 < q->count)
+            q->pos++;
+        else
+            q->pos = 0;
+        return 0;
+    }
+    return advance(q);
 }
 
 int tp_queue_prev(struct tp_play_queue *q)
 {
     if (!q || !q->count)
         return -1;
-    q->pos = (q->pos == 0) ? q->count - 1 : q->pos - 1;
-    return 0;
+
+    if (q->pos > 0) {
+        q->pos--;
+        return 0;
+    }
+    /* Back from the first track wraps only if the end is reachable at all. */
+    if (q->repeat == TP_REPEAT_ALL) {
+        q->pos = q->count - 1;
+        return 0;
+    }
+    return -1;
 }

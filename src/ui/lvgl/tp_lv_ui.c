@@ -15,6 +15,7 @@
 #include "tp_lv_ui.h"
 #include "tp_lv_screens.h"
 #include "tp_lv_input.h"
+#include "tp_volume.h"
 
 #include "tp_app.h"
 #include "tp_browse.h"
@@ -70,6 +71,15 @@ struct view {
 
 #define MAX_DEPTH 6
 
+/*
+ * How far one press moves the volume.
+ *
+ * The codec's control has 89 steps, which is far more than anyone wants to
+ * press through; five percent puts the whole range within twenty presses and
+ * still lands somewhere different every time.
+ */
+#define VOLUME_STEP 5
+
 struct ui {
     struct tp_app *app;
     struct view stack[MAX_DEPTH];
@@ -116,6 +126,19 @@ struct ui {
      * The path is per level so that going back returns to where you were
      * rather than to the root.
      */
+    /*
+     * The row being adjusted rather than activated.
+     *
+     * With three buttons there is nowhere to put a volume control: the volume
+     * keys are the list, and on Now Playing they are the transport. So a
+     * settings row can be opened INTO - selecting Volume hands the volume keys
+     * to the volume until you hold PLAY to give them back. The hint bar says
+     * so while it is happening, because nothing else on screen would.
+     */
+    int adjusting;           /* which settings row, or -1 */
+    int volume;              /* last read, so the row can draw without a
+                                mixer call on every frame */
+
     struct tp_browse browse;
     char             browse_path[TP_BROWSE_PATH_MAX];
     char             browse_err[96];
@@ -187,13 +210,54 @@ static void dur_badge(uint32_t ms, char *out, size_t cap)
 
 /* Is this the track currently sounding? Compared by id, because the queue can
    hold the same track twice and the pointer would not tell them apart. */
+/*
+ * The repeat setting, as the queue wants it.
+ *
+ * Kept in the config as a word because that is what is written to disk and
+ * what a person editing the file by hand would expect to see.
+ */
+static enum tp_repeat repeat_from_cfg(struct tp_app *app)
+{
+    if (!strcmp(app->cfg.repeat, "one"))
+        return TP_REPEAT_ONE;
+    if (!strcmp(app->cfg.repeat, "all"))
+        return TP_REPEAT_ALL;
+    return TP_REPEAT_OFF;
+}
+
+static const char *repeat_label(struct tp_app *app)
+{
+    switch (repeat_from_cfg(app)) {
+    case TP_REPEAT_ONE: return "One";
+    case TP_REPEAT_ALL: return "All";
+    default:            return "Off";
+    }
+}
+
+/* Off, All, One, and round again. */
+static void repeat_cycle(struct tp_app *app)
+{
+    const char *next;
+
+    switch (repeat_from_cfg(app)) {
+    case TP_REPEAT_OFF: next = "all"; break;
+    case TP_REPEAT_ALL: next = "one"; break;
+    default:            next = "off"; break;
+    }
+    snprintf(app->cfg.repeat, sizeof app->cfg.repeat, "%s", next);
+    app->queue.repeat = repeat_from_cfg(app);
+    tp_config_save(&app->cfg);
+}
+
 static int is_current(struct tp_app *app, uint64_t id)
 {
     if (tp_player_state(app->player) == TP_PLAYER_STOPPED)
         return 0;
-    if (!app->queue.count || app->queue.pos >= app->queue.count)
-        return 0;
-    return app->queue.ids[app->queue.pos] == id;
+    {
+        const struct tp_queue_item *it = tp_queue_current(&app->queue);
+
+        return it && it->id == id;
+    }
 }
 
 /* ---- row fillers ---------------------------------------------------------- */
@@ -455,10 +519,22 @@ static void fill_tracks(int i, struct tp_lv_row *out, void *ctx)
     out->playing = is_current(app, t->track_id) ? true : false;
 }
 
+/* The rows that do something when chosen, by name rather than by number:
+   this list has been renumbered twice and each time a case label somewhere
+   else was left pointing at the wrong row. */
+#define S_SHUFFLE 0
+#define S_REPEAT  1
+#define S_VOLUME  2
+#define S_BACKEND 3
+#define S_LIBRARY 4
+#define S_HIDDEN  5
+#define S_STOP    6
+#define SETTINGS_N 7
+
 static void fill_settings(int i, struct tp_lv_row *out, void *ctx)
 {
     struct tp_app *app = ctx;
-    static char v[4][48];
+    static char v[7][48];
 
     switch (i) {
     case 0:
@@ -466,7 +542,23 @@ static void fill_settings(int i, struct tp_lv_row *out, void *ctx)
         snprintf(v[0], sizeof v[0], "%s", app->cfg.shuffle ? "On" : "Off");
         out->line2 = v[0];
         break;
-    case 1: {
+    case S_REPEAT:
+        out->line1 = "Repeat";
+        snprintf(v[5], sizeof v[5], "%s", repeat_label(app));
+        out->line2 = v[5];
+        break;
+    case S_VOLUME:
+        out->line1 = "Volume";
+        if (!tp_volume_available())
+            snprintf(v[6], sizeof v[6], "no mixer control");
+        else if (s_ui.adjusting == S_VOLUME)
+            snprintf(v[6], sizeof v[6], "%d%%  <- VOL +/- ->", s_ui.volume);
+        else
+            snprintf(v[6], sizeof v[6], "%d%%  (PLAY to change)",
+                     s_ui.volume);
+        out->line2 = v[6];
+        break;
+    case 3: {
         /*
          * The backend, what the device gave us, and how often it has had to
          * restart. The last of those is the one worth having: an underrun is
@@ -493,12 +585,12 @@ static void fill_settings(int i, struct tp_lv_row *out, void *ctx)
         out->line2 = v[1];
         break;
     }
-    case 2:
+    case 4:
         out->line1 = "Library source";
         snprintf(v[2], sizeof v[2], "%zu tracks", app->lib.track_count);
         out->line2 = v[2];
         break;
-    case 3:
+    case 5:
         out->line1 = "Show hidden files";
         snprintf(v[3], sizeof v[3], "%s", s_ui.show_hidden ? "On" : "Off");
         out->line2 = v[3];
@@ -509,8 +601,6 @@ static void fill_settings(int i, struct tp_lv_row *out, void *ctx)
         break;
     }
 }
-
-#define SETTINGS_N 5
 
 /* ---- building a drill-down ------------------------------------------------ */
 
@@ -736,9 +826,9 @@ static void activate(void)
         switch (v->sel) {
         case 0:
             app->cfg.shuffle = 1;
-            tp_queue_from_library(&app->queue, &app->lib, 1);
-            if (app->queue.count &&
-                tp_app_cmd_play_id(app, app->queue.ids[0]) == 0)
+            app->queue.repeat = repeat_from_cfg(app);
+            if (tp_queue_from_library(&app->queue, &app->lib, 1) == 0 &&
+                tp_app_play_current(app) == 0)
                 s_ui.was_playing = 1;
             push(V_NOW, 0, NULL);
             break;
@@ -826,8 +916,27 @@ static void activate(void)
         break;
 
     case V_TRACKS:
-        if ((size_t)v->sel < s_ui.filtered_n)
-            play_index(s_ui.filtered[v->sel]);
+        /*
+         * The album is the queue, not the whole library.
+         *
+         * Choosing the third track of an album used to play it and then carry
+         * on through a shuffle of everything, because the queue was rebuilt
+         * from the library on the way. The list on screen is the queue.
+         */
+        if ((size_t)v->sel < s_ui.filtered_n) {
+            app->queue.repeat = repeat_from_cfg(app);
+            if (tp_queue_from_indices(&app->queue, &app->lib, s_ui.filtered,
+                                      s_ui.filtered_n, s_ui.filtered[v->sel],
+                                      app->cfg.shuffle) == 0) {
+                push(V_NOW, 0, NULL);
+                draw();
+                lv_refr_now(NULL);
+                if (tp_app_play_current(app) == 0)
+                    s_ui.was_playing = 1;
+            } else {
+                play_index(s_ui.filtered[v->sel]);
+            }
+        }
         break;
 
     case V_FILES: {
@@ -856,6 +965,7 @@ static void activate(void)
         push(V_NOW, 0, NULL);
         draw();
         lv_refr_now(NULL);
+        app->queue.repeat = repeat_from_cfg(app);
         if (tp_app_cmd_play_file(app, next) == 0)
             s_ui.was_playing = 1;
         break;
@@ -867,21 +977,33 @@ static void activate(void)
         } else if (tp_player_state(app->player) == TP_PLAYER_PAUSED) {
             tp_app_cmd_resume(app);
         } else if (app->queue.count) {
-            tp_app_cmd_play_id(app, app->queue.ids[app->queue.pos]);
+            tp_app_play_current(app);
             s_ui.was_playing = 1;
         }
         break;
 
     case V_SETTINGS:
-        if (v->sel == 0) {
+        if (v->sel == S_SHUFFLE) {
             app->cfg.shuffle = !app->cfg.shuffle;
-        } else if (v->sel == 3) {
+            /* Reorder what is queued rather than rebuilding it: the track
+               playing carries on playing, and turning shuffle back off puts
+               the album back in its own order. */
+            tp_queue_set_shuffle(&app->queue, app->cfg.shuffle);
+            tp_config_save(&app->cfg);
+        } else if (v->sel == S_REPEAT) {
+            repeat_cycle(app);
+        } else if (v->sel == S_VOLUME) {
+            if (tp_volume_available()) {
+                s_ui.adjusting = S_VOLUME;
+                s_ui.volume = tp_volume_get();
+            }
+        } else if (v->sel == S_HIDDEN) {
             /* Re-read the folder in hand, so the switch takes effect where
                you can see it rather than the next time you open one. */
             s_ui.show_hidden = !s_ui.show_hidden;
             if (s_ui.browse_path[0])
                 browse_load();
-        } else if (v->sel == SETTINGS_N - 1) {
+        } else if (v->sel == S_STOP) {
             tp_app_cmd_stop(app);
             s_ui.was_playing = 0;
         }
@@ -913,31 +1035,31 @@ static void draw(void)
     switch (v->kind) {
     case V_MENU:
         tp_lv_show_list("TinyPod", count, v->sel, v->top, fill_menu, app, NULL);
-        tp_lv_set_hint("VOL move   PLAY open");
+        tp_lv_set_hint("VOL move   PLAY open   HOME exit");
         break;
 
     case V_SONGS:
         tp_lv_show_list("Songs", count, v->sel, v->top, fill_songs, app,
                         "No tracks found");
-        tp_lv_set_hint("PLAY play   hold PLAY back");
+        tp_lv_set_hint("PLAY play   HOME back");
         break;
 
     case V_ARTISTS:
         tp_lv_show_list("Artists", count, v->sel, v->top, fill_artists, app,
                         "No artists");
-        tp_lv_set_hint("PLAY open   hold PLAY back");
+        tp_lv_set_hint("PLAY open   HOME back");
         break;
 
     case V_ALBUMS:
         tp_lv_show_list("Albums", count, v->sel, v->top, fill_albums, app,
                         "No albums");
-        tp_lv_set_hint("PLAY open   hold PLAY back");
+        tp_lv_set_hint("PLAY open   HOME back");
         break;
 
     case V_PLAYLISTS:
         tp_lv_show_list("Playlists", count, v->sel, v->top, fill_playlists,
                         app, "No playlists");
-        tp_lv_set_hint("PLAY open   hold PLAY back");
+        tp_lv_set_hint("PLAY open   HOME back");
         break;
 
     case V_LETTERS:
@@ -945,7 +1067,7 @@ static void draw(void)
                  safe(v->title, "Jump to"));
         tp_lv_show_list(s_ui.title_buf, count, v->sel, v->top, fill_letters,
                         app, "Nothing to jump to");
-        tp_lv_set_hint("PLAY jump   hold PLAY back");
+        tp_lv_set_hint("PLAY jump   HOME back");
         break;
 
     case V_ARTIST_ALBUMS:
@@ -953,7 +1075,7 @@ static void draw(void)
                  safe(v->title, "Albums"));
         tp_lv_show_list(s_ui.title_buf, count, v->sel, v->top,
                         fill_artist_albums, app, "No albums");
-        tp_lv_set_hint("PLAY open   hold PLAY back");
+        tp_lv_set_hint("PLAY open   HOME back");
         break;
 
     case V_TRACKS:
@@ -961,7 +1083,7 @@ static void draw(void)
                  safe(v->title, "Tracks"));
         tp_lv_show_list(s_ui.title_buf, count, v->sel, v->top, fill_tracks,
                         app, "No tracks here");
-        tp_lv_set_hint("PLAY play   hold PLAY back");
+        tp_lv_set_hint("PLAY play   HOME back");
         break;
 
     case V_FILES: {
@@ -977,14 +1099,17 @@ static void draw(void)
         tp_lv_show_list(leaf, count, v->sel, v->top, fill_files, app,
                         s_ui.browse_err[0] ? s_ui.browse_err
                                            : "Nothing here to play");
-        tp_lv_set_hint("PLAY open   hold PLAY back");
+        tp_lv_set_hint("PLAY open   HOME back");
         break;
     }
 
     case V_SETTINGS:
         tp_lv_show_list("Settings", count, v->sel, v->top, fill_settings, app,
                         NULL);
-        tp_lv_set_hint("PLAY change   hold PLAY back");
+        if (s_ui.adjusting == S_VOLUME)
+            tp_lv_set_hint("VOL +/-   PLAY or HOME done");
+        else
+            tp_lv_set_hint("PLAY change   HOME back");
         break;
 
     case V_NOW: {
@@ -993,24 +1118,40 @@ static void draw(void)
 
         memset(&n, 0, sizeof n);
 
-        if (app->queue.count && app->queue.pos < app->queue.count) {
-            size_t i;
-            uint64_t id = app->queue.ids[app->queue.pos];
-            for (i = 0; i < app->lib.track_count; i++) {
-                if (app->lib.tracks[i].track_id == id) {
-                    t = &app->lib.tracks[i];
-                    break;
+        /*
+         * Whatever the queue says is playing - which is the only thing that
+         * knows. This used to look up queue.ids[pos] in the library and show
+         * that, so a file played from the browser was named after whichever
+         * track the stale queue position happened to point at.
+         */
+        {
+            const struct tp_queue_item *it = tp_queue_current(&app->queue);
+
+            if (it) {
+                size_t i;
+
+                if (it->id) {
+                    for (i = 0; i < app->lib.track_count; i++) {
+                        if (app->lib.tracks[i].track_id == it->id) {
+                            t = &app->lib.tracks[i];
+                            break;
+                        }
+                    }
                 }
+                n.index = (int)tp_queue_index(&app->queue);
+                n.total = (int)app->queue.count;
+
+                /* A file the library has never heard of: its own name. */
+                if (!t && it->title)
+                    n.title = it->title;
             }
-            n.index = (int)app->queue.pos + 1;
-            n.total = (int)app->queue.count;
         }
 
         if (t) {
             n.title = safe(t->title, "Unknown title");
             n.artist = safe(t->artist, "Unknown artist");
             n.album = safe(t->album, NULL);
-        } else {
+        } else if (!n.title) {
             n.title = tp_player_current_title(app->player);
         }
 
@@ -1042,7 +1183,7 @@ static void draw(void)
         }
 
         tp_lv_show_now(&n);
-        tp_lv_set_hint("VOL track   PLAY pause   hold back");
+        tp_lv_set_hint("VOL track   PLAY pause   HOME back");
         break;
     }
 
@@ -1053,7 +1194,7 @@ static void draw(void)
         static char about[256];
         snprintf(about, sizeof about, "TinyPod\n\n%s", tp_build_version());
         tp_lv_show_message("About", about);
-        tp_lv_set_hint("hold PLAY back");
+        tp_lv_set_hint("HOME back");
         break;
     }
     }
@@ -1065,6 +1206,30 @@ static void on_key(enum tp_lv_key k)
 {
     struct view *v = top_view();
     struct tp_app *app = s_ui.app;
+
+    /*
+     * Adjusting a setting takes the volume keys for as long as it lasts.
+     *
+     * Held by PLAY, the same button that gets you out of everything else
+     * here, so there is one way back rather than a special case to remember.
+     */
+    if (s_ui.adjusting >= 0) {
+        switch (k) {
+        case TP_LV_UP:
+            s_ui.volume = tp_volume_step(+VOLUME_STEP);
+            return;
+        case TP_LV_DOWN:
+            s_ui.volume = tp_volume_step(-VOLUME_STEP);
+            return;
+        case TP_LV_BACK:
+        case TP_LV_HOME:
+        case TP_LV_SELECT:
+            s_ui.adjusting = -1;
+            return;
+        default:
+            return;
+        }
+    }
 
     /* On Now Playing the volume keys are transport, because there is no list
        to move through and skipping tracks is what you actually want there. */
@@ -1092,9 +1257,26 @@ static void on_key(enum tp_lv_key k)
         activate();
         break;
     case TP_LV_BACK:
-        /* At the top there is nowhere further back. HOME leaves the app, and
-           that is the launcher's job, not ours. */
+        /* Hold PLAY: one level back, and nothing at the top. Leaving is what
+           HOME is for, so a long press cannot drop you out by accident. */
         if (s_ui.depth > 0) pop();
+        break;
+
+    case TP_LV_HOME:
+        /*
+         * Back, and out.
+         *
+         * The launcher used to take HOME and kill whatever was running, which
+         * meant an app could not use its own fourth button and quitting was
+         * indistinguishable from a crash - no chance to write the config or
+         * stop the sink. Now the app owns it: back through the stack, and
+         * from the top screen it exits, which the launcher sees as a clean
+         * exit because that is what it is.
+         */
+        if (s_ui.depth > 0)
+            pop();
+        else
+            s_ui.running = 0;
         break;
     case TP_LV_QUIT:
         s_ui.running = 0;
@@ -1175,6 +1357,8 @@ int tp_lv_ui_shots(struct tp_app *app, const char *dir)
     int made = 0;
 
     memset(&s_ui, 0, sizeof s_ui);
+    /* Not adjusting anything. Zero would be a real settings row. */
+    s_ui.adjusting = -1;
     s_ui.app = app;
     s_ui.running = 1;
     s_ui.stack[0].kind = V_MENU;
@@ -1256,6 +1440,8 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
     unsigned long last_now = 0;
 
     memset(&s_ui, 0, sizeof s_ui);
+    /* Not adjusting anything. Zero would be a real settings row. */
+    s_ui.adjusting = -1;
     s_ui.app = app;
     s_ui.running = 1;
     s_ui.stack[0].kind = V_MENU;
@@ -1296,7 +1482,7 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
                            "Mount the disk with\n"
                            "n31-mount-disk, then\n"
                            "start TinyPod again.");
-        tp_lv_set_hint("hold PLAY back");
+        tp_lv_set_hint("HOME back");
         lv_refr_now(NULL);
     } else if (!app->loaded) {
         tp_lv_show_scan(app->vol.ipod_control_root, "starting", -1);
@@ -1368,8 +1554,14 @@ int tp_lv_ui_run(struct tp_app *app, const char *fb)
                         "The audio device is most likely refusing output. "
                         "The files themselves are probably fine.");
                 } else if (app->queue.count > 0 &&
-                           tp_app_cmd_next(app) == 0) {
+                           tp_app_cmd_advance(app) == 0) {
+                    /* advance, not next: this is a track ENDING, which is
+                       what Repeat One is about. At the end of a queue with
+                       repeat off it returns non-zero and playback stops,
+                       which is what Off means. */
                     s_ui.was_playing = 1;
+                } else {
+                    s_ui.was_playing = 0;
                 }
                 redraw = 1;
             }

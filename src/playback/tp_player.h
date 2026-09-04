@@ -74,18 +74,112 @@ const char *tp_player_codec(struct tp_player *p);
 const char *tp_player_last_error(struct tp_player *p);
 const char *tp_player_current_title(struct tp_player *p);
 
-/* Queue helpers used by app */
+/*
+ * What is queued up, and in what order.
+ *
+ * An entry is either a library track or a plain file. It has to be both,
+ * because the folder browser plays things the database has never heard of -
+ * and a queue of library ids alone was why picking a file from a folder left
+ * the previous shuffle running underneath it, so Next jumped somewhere else
+ * entirely and Now Playing named a track that was not the one you could hear.
+ *
+ * path is always set. id is the library track when there is one, and zero
+ * when there is not; title is what to put on screen for a file that has no
+ * database entry to ask.
+ */
+struct tp_queue_item {
+    uint64_t id;
+    char    *path;
+    char    *title;
+};
+
+enum tp_repeat {
+    TP_REPEAT_OFF = 0,   /* stop at the end of the queue */
+    TP_REPEAT_ALL,       /* wrap round to the start */
+    TP_REPEAT_ONE        /* the same track again */
+};
+
+/*
+ * Shuffle is an ORDER over the items, not a permutation of them.
+ *
+ * Shuffling the array in place loses the album order for good, so turning
+ * shuffle back off could not put it back - and the position was an index into
+ * an array that had moved under it. order[] keeps the items where they are:
+ * order[i] is which item plays i-th, pos is an index into order, and turning
+ * shuffle off is rebuilding order as the identity while holding on to the
+ * item that is playing.
+ */
 struct tp_play_queue {
-    uint64_t *ids;
-    size_t count;
-    size_t pos;
+    struct tp_queue_item *items;
+    size_t  count;
+
+    size_t *order;
+    size_t  pos;         /* index into order, not into items */
+
     int shuffle;
+    enum tp_repeat repeat;
 };
 
 void tp_queue_init(struct tp_play_queue *q);
 void tp_queue_free(struct tp_play_queue *q);
+
+/* The item that plays now, or NULL when the queue is empty. */
+const struct tp_queue_item *tp_queue_current(const struct tp_play_queue *q);
+
+/* Where in the running order it is, one-based, for "3 of 12". */
+size_t tp_queue_index(const struct tp_play_queue *q);
+
 int tp_queue_from_library(struct tp_play_queue *q, struct tp_library *lib, int shuffle);
+
+/*
+ * A drill-down as the queue: `idx` are indices into lib->tracks, in the order
+ * the list showed them, and `start` is which of them was picked.
+ *
+ * Without this, choosing a track inside an album played it and then carried on
+ * through whatever queue happened to exist - so the second track was rarely
+ * the second track of the album.
+ */
+int tp_queue_from_indices(struct tp_play_queue *q, struct tp_library *lib,
+                          const size_t *idx, size_t n, size_t start,
+                          int shuffle);
+
+/*
+ * Move to a track already in the queue. Returns 0 if it was there, -1 if not,
+ * which is how a caller tells "somewhere else in this album" from "somewhere
+ * else entirely, build a new queue".
+ */
+int tp_queue_seek_id(struct tp_play_queue *q, uint64_t id);
+
+/*
+ * Everything playable in one folder, in name order, starting at `start`.
+ *
+ * `start` is matched by path; when it is not in the folder the queue still
+ * builds and starts at the top. ids are filled in from the library where a
+ * file happens to be in it, so a folder of tracks that ARE in the database
+ * still shows their proper titles.
+ */
+int tp_queue_from_folder(struct tp_play_queue *q, struct tp_library *lib,
+                         const char *folder, const char *start, int shuffle);
+
+/* One file, and nothing after it. */
+int tp_queue_from_file(struct tp_play_queue *q, struct tp_library *lib,
+                       const char *path);
+
+/*
+ * Move. Returns -1 when there is nowhere to go, which is how the end of a
+ * queue with repeat off stops playback instead of wrapping.
+ *
+ * next() honours TP_REPEAT_ONE; skip_next() is the same move with the button
+ * pressed, where repeating one track would look like the button did nothing.
+ */
 int tp_queue_next(struct tp_play_queue *q);
+int tp_queue_skip_next(struct tp_play_queue *q);
 int tp_queue_prev(struct tp_play_queue *q);
+
+/*
+ * Turn shuffle on or off without losing your place: whatever is playing stays
+ * playing, and becomes the position in the new order.
+ */
+void tp_queue_set_shuffle(struct tp_play_queue *q, int shuffle);
 
 #endif
