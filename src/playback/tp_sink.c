@@ -28,6 +28,220 @@
 int pcm_state(struct pcm *pcm);
 #endif
 
+#ifdef TINYPOD_HAVE_ALSALIB
+#include <alsa/asoundlib.h>
+
+/*
+ * alsa-lib, wearing tinyalsa's interface.
+ *
+ * Why at all
+ * ----------
+ *
+ * On this device tinyalsa's view of the stream is wrong. The status page it
+ * mmaps never updates, so the hardware pointer it reads is always zero, the
+ * state it reports never changes, and it re-prepares the stream before every
+ * write. From out here that looks like a stream stuck in PREPARED for ever:
+ * one write lands, nothing drains, and the writer spins.
+ *
+ * TinyGB found this first and moved for the same reason - see the comment
+ * above TG_AUDIO in its Makefile.n31 - and mpg123 and ffplay, which both use
+ * alsa-lib, play correctly on the same hardware.
+ *
+ * It is worth being clear that this is not the same thing as the start
+ * threshold that used to be set to a whole buffer here. That was a real
+ * defect and it is fixed, but it could never have caused this: when the
+ * hardware pointer never moves, no threshold is reachable. Fixing it removed
+ * a bug and did not remove the symptom.
+ *
+ * Why it looks like this
+ * ----------------------
+ *
+ * The rest of this file is a thousand lines of converter, ladder and
+ * recovery logic that has been tuned against real hardware, and none of it
+ * cares which library moves the bytes. So rather than edit thirteen call
+ * sites, this presents the handful of tinyalsa entry points the file uses.
+ * The names are tinyalsa's; the implementation is not. They are only defined
+ * when tinyalsa itself is absent, so the two can never collide.
+ *
+ * snd_pcm_set_params does the part that had to be worked out by hand before:
+ * it picks a period and buffer the device will accept and sets the start and
+ * stop thresholds to match them, rather than to what was asked for.
+ */
+
+#define PCM_OUT            0
+#define PCM_FORMAT_S16_LE  0
+#define PCM_STATE_RUNNING  SND_PCM_STATE_RUNNING
+#define PCM_STATE_DRAINING SND_PCM_STATE_DRAINING
+
+#define PCM_PARAM_RATE     0
+#define PCM_PARAM_CHANNELS 1
+
+struct pcm_config {
+    unsigned int channels, rate, period_size, period_count, format;
+    unsigned int start_threshold, stop_threshold, silence_threshold, avail_min;
+};
+
+struct pcm {
+    snd_pcm_t *h;
+    unsigned int rate, channels;
+    int ready;
+};
+
+/* The capability line on the error path. alsa-lib answers this from the
+   refined hardware parameters rather than from a static range. */
+struct pcm_params { unsigned int rmin, rmax, cmin, cmax; };
+
+static struct pcm_params *pcm_params_get(unsigned int card, unsigned int device,
+                                         unsigned int flags)
+{
+    char name[32];
+    snd_pcm_hw_params_t *hw = 0;
+    snd_pcm_t *h = 0;
+    struct pcm_params *p;
+
+    (void)flags;
+    p = calloc(1, sizeof *p);
+    if (!p) return 0;
+
+    snprintf(name, sizeof name, "hw:%u,%u", card, device);
+    if (snd_pcm_open(&h, name, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0)
+        return p;                       /* zeros; the message says nothing */
+
+    snd_pcm_hw_params_malloc(&hw);
+    if (hw && snd_pcm_hw_params_any(h, hw) >= 0) {
+        int dir = 0;
+        snd_pcm_hw_params_get_rate_min(hw, &p->rmin, &dir);
+        snd_pcm_hw_params_get_rate_max(hw, &p->rmax, &dir);
+        snd_pcm_hw_params_get_channels_min(hw, &p->cmin);
+        snd_pcm_hw_params_get_channels_max(hw, &p->cmax);
+    }
+    if (hw) snd_pcm_hw_params_free(hw);
+    snd_pcm_close(h);
+    return p;
+}
+
+static unsigned int pcm_params_get_min(struct pcm_params *p, unsigned int what)
+{
+    if (!p) return 0;
+    return what == PCM_PARAM_RATE ? p->rmin : p->cmin;
+}
+
+static unsigned int pcm_params_get_max(struct pcm_params *p, unsigned int what)
+{
+    if (!p) return 0;
+    return what == PCM_PARAM_RATE ? p->rmax : p->cmax;
+}
+
+static void pcm_params_free(struct pcm_params *p) { free(p); }
+
+static struct pcm *pcm_open(unsigned int card, unsigned int device,
+                            unsigned int flags, struct pcm_config *cfg)
+{
+    char name[32];
+    struct pcm *s;
+    unsigned int us;
+    int rc;
+
+    (void)flags;
+    s = calloc(1, sizeof *s);
+    if (!s) return 0;
+
+    snprintf(name, sizeof name, "hw:%u,%u", card, device);
+    if (snd_pcm_open(&s->h, name, SND_PCM_STREAM_PLAYBACK, 0) < 0) {
+        s->h = 0;
+        return s;                       /* not ready; the caller reports it */
+    }
+
+    /*
+     * The buffer, expressed as the time it holds rather than as a frame
+     * count, because that is what set_params takes and what the shape ladder
+     * above actually means. Zero for the resample argument: if this rate is
+     * not available the call fails and the ladder moves on, rather than
+     * quietly inserting a converter and playing at the wrong pitch.
+     */
+    us = cfg->rate ? (unsigned int)((unsigned long long)cfg->period_size
+                                    * cfg->period_count * 1000000ull / cfg->rate)
+                   : 200000u;
+    if (us < 20000u) us = 20000u;
+
+    rc = snd_pcm_set_params(s->h, SND_PCM_FORMAT_S16_LE,
+                            SND_PCM_ACCESS_RW_INTERLEAVED,
+                            cfg->channels, cfg->rate, 0, us);
+    if (rc < 0) {
+        snd_pcm_close(s->h);
+        s->h = 0;
+        return s;
+    }
+
+    s->rate = cfg->rate;
+    s->channels = cfg->channels;
+    s->ready = 1;
+    return s;
+}
+
+static int pcm_is_ready(struct pcm *s) { return s && s->ready; }
+static unsigned int pcm_get_rate(struct pcm *s) { return s ? s->rate : 0; }
+static unsigned int pcm_get_channels(struct pcm *s) { return s ? s->channels : 0; }
+
+/*
+ * Frames written, or negative. Underruns are recovered here and are NOT
+ * hidden: snd_pcm_recover returns zero when it fixed one, which is the signal
+ * the caller uses to count them. tinyalsa recovered silently and returned
+ * success, which is the reason a stream restarting several times a second
+ * looked exactly like one playing cleanly.
+ */
+static int pcm_writei(struct pcm *s, const void *data, unsigned int frames)
+{
+    snd_pcm_sframes_t n;
+
+    if (!s || !s->h) return -1;
+
+    n = snd_pcm_writei(s->h, data, frames);
+    if (n < 0) {
+        if (snd_pcm_recover(s->h, (int)n, 1 /* silent */) < 0)
+            return -1;
+        n = snd_pcm_writei(s->h, data, frames);
+        if (n < 0) return -1;
+    }
+    return (int)n;
+}
+
+static int pcm_state(struct pcm *s)
+{
+    return (s && s->h) ? (int)snd_pcm_state(s->h) : -1;
+}
+
+static int pcm_prepare(struct pcm *s)
+{
+    return (s && s->h) ? snd_pcm_prepare(s->h) : -1;
+}
+
+/* Drop rather than drain: every caller of this wants the buffer discarded -
+   a seek, a stop, a track change - and draining would play out audio the
+   listener has already moved past. */
+static int pcm_stop(struct pcm *s)
+{
+    return (s && s->h) ? snd_pcm_drop(s->h) : -1;
+}
+
+static int pcm_close(struct pcm *s)
+{
+    if (!s) return -1;
+    if (s->h) snd_pcm_close(s->h);
+    free(s);
+    return 0;
+}
+#endif /* TINYPOD_HAVE_ALSALIB */
+
+/*
+ * Either library. The shim above gives alsa-lib the same entry points
+ * tinyalsa has, so every path below this line works through whichever one was
+ * compiled in and none of them needs to know which.
+ */
+#if defined(TINYPOD_HAVE_TINYALSA) || defined(TINYPOD_HAVE_ALSALIB)
+#define TINYPOD_HAVE_ALSA 1
+#endif
+
 /*
  * OSS is the fallback. The N31 kernel exposes both: tinyalsa talks to
  * /dev/snd, which is the path n31-sine proved, and the OSS emulation puts the
@@ -58,7 +272,7 @@ struct tp_sink {
     enum sink_kind kind;
     int rate;
     int channels;
-#ifdef TINYPOD_HAVE_TINYALSA
+#ifdef TINYPOD_HAVE_ALSA
     struct pcm *pcm;
 #endif
     int fd;              /* OSS */
@@ -108,7 +322,7 @@ static void fail(char *err, size_t errsz, const char *fmt, ...)
 
 int tp_sink_available(void)
 {
-#if defined(TINYPOD_HAVE_TINYALSA) || defined(TINYPOD_HAVE_OSS)
+#if defined(TINYPOD_HAVE_ALSA) || defined(TINYPOD_HAVE_OSS)
     return 1;
 #else
     return 0;
@@ -119,7 +333,7 @@ int tp_sink_available(void)
 
 static struct tp_sink *alsa_open(int rate, int channels, char *err, size_t errsz)
 {
-#ifdef TINYPOD_HAVE_TINYALSA
+#ifdef TINYPOD_HAVE_ALSA
     struct tp_sink *s;
     struct pcm_config cfg;
     unsigned int card = 0, device = 0;
@@ -986,7 +1200,7 @@ int tp_sink_write(struct tp_sink *s, const int16_t *pcm, int samples)
     }
 #endif
 
-#ifdef TINYPOD_HAVE_TINYALSA
+#ifdef TINYPOD_HAVE_ALSA
     if (s->kind == SINK_ALSA) {
         unsigned int frames;
         const char *p;
@@ -1097,7 +1311,7 @@ void tp_sink_flush(struct tp_sink *s)
         soxr_clear(s->soxr);
 #endif
 
-#ifdef TINYPOD_HAVE_TINYALSA
+#ifdef TINYPOD_HAVE_ALSA
     if (s->kind == SINK_ALSA && s->pcm) {
         /* stop drops what is queued; prepare makes the stream writable
            again. The pair is what pause/resume already does, and it is the
@@ -1117,7 +1331,7 @@ void tp_sink_pause(struct tp_sink *s, int paused)
 {
     if (!s)
         return;
-#ifdef TINYPOD_HAVE_TINYALSA
+#ifdef TINYPOD_HAVE_ALSA
     if (s->kind == SINK_ALSA && s->pcm) {
         if (paused)
             pcm_stop(s->pcm);
@@ -1142,7 +1356,7 @@ void tp_sink_drain(struct tp_sink *s)
 {
     if (!s)
         return;
-#ifdef TINYPOD_HAVE_TINYALSA
+#ifdef TINYPOD_HAVE_ALSA
     if (s->kind == SINK_ALSA && s->pcm) {
         /*
          * Play out what is queued, rather than throwing it away.
@@ -1188,7 +1402,7 @@ void tp_sink_close(struct tp_sink *s)
             put32(s->wav, s->wav_bytes);
         fclose(s->wav);
     }
-#ifdef TINYPOD_HAVE_TINYALSA
+#ifdef TINYPOD_HAVE_ALSA
     if (s->kind == SINK_ALSA && s->pcm)
         pcm_close(s->pcm);
     free(s->conv);

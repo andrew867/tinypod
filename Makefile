@@ -164,6 +164,34 @@ endif
 
 # tinyalsa: point at an unpacked tinyalsa tree to get real audio output.
 # Without it the build still decodes (see the "decode" command) but cannot play.
+# alsa-lib, and why it is the one to reach for on this device.
+#
+# tinyalsa is five files with no dependencies and would be the obvious choice.
+# On this hardware its view of the stream is wrong: the status page it mmaps
+# never updates, so the hardware pointer it reads stays at zero, the state it
+# reports never changes, and it re-prepares the stream before every write.
+# From the application that looks like a stream stuck in PREPARED for ever -
+# one write lands, nothing drains, and the writer spins at ninety per cent of
+# the CPU.
+#
+# TinyGB found it first and moved for the same reason, and mpg123 and ffplay
+# both use alsa-lib and play correctly on the same hardware. The cost is a
+# megabyte of library and a config tree at /usr/share/alsa, which the
+# initramfs already carries for TinyGB.
+#
+#   make TARGET=n31 ALSALIB_DIR=... n31      alsa-lib
+#   make TARGET=n31 TINYALSA_DIR=... n31     tinyalsa
+#
+# tinyalsa stays supported rather than being deleted: it is much the smaller
+# of the two, and the fault is in the driver's status page rather than in the
+# library, so it may simply start working.
+ALSALIB_DIR ?=
+ifneq ($(ALSALIB_DIR),)
+  CDEFS += -DTINYPOD_HAVE_ALSALIB
+  INCLUDES += -I$(ALSALIB_DIR)/include
+  ALSALIB_LIB := $(ALSALIB_DIR)/lib/libasound.a
+endif
+
 TINYALSA_DIR ?=
 ifneq ($(TINYALSA_DIR),)
   CDEFS += -DTINYPOD_HAVE_TINYALSA
@@ -189,13 +217,13 @@ ifeq ($(TARGET),n31)
   ARCH := -mcpu=cortex-a5 -mfpu=vfpv4 -mfloat-abi=softfp
   CFLAGS := -Os $(ARCH) -static $(WARN) $(INCLUDES) $(CDEFS) -DTINYPOD_N31
   DECFLAGS := -O2 $(ARCH) -DARM $(INCLUDES) $(CDEFS)
-  LDFLAGS := -static $(TINYALSA_LIB) $(LVGL_LIB) $(FFMPEG_LIBS) $(SOXR_LIB) -lpthread -ldl -lm
+  LDFLAGS := -static $(TINYALSA_LIB) $(ALSALIB_LIB) $(LVGL_LIB) $(FFMPEG_LIBS) $(SOXR_LIB) -lpthread -ldl -lm
 else
   CC ?= gcc
   ARCH :=
   CFLAGS := -O2 -g $(WARN) $(INCLUDES) $(CDEFS)
   DECFLAGS := -O2 $(INCLUDES) $(CDEFS)
-  LDFLAGS := $(TINYALSA_LIB) $(LVGL_LIB) $(FFMPEG_LIBS) $(SOXR_LIB) -lpthread -ldl -lm
+  LDFLAGS := $(TINYALSA_LIB) $(ALSALIB_LIB) $(LVGL_LIB) $(FFMPEG_LIBS) $(SOXR_LIB) -lpthread -ldl -lm
 endif
 
 APP_OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRC_APP))
