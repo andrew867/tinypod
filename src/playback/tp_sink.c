@@ -171,7 +171,29 @@ static struct tp_sink *alsa_open(int rate, int channels, char *err, size_t errsz
         { 20, 4 },   /*  80 ms */
         { 10, 4 },   /*  40 ms - what this used to be, and what stuttered */
     };
+    /*
+     * The two knobs the comment above promises.
+     *
+     * They were documented, declared, and never assigned - so the documented
+     * way to try a buffer shape on the device without a rebuild did nothing
+     * at all, silently, which is worse than not offering one. Anybody using
+     * them to narrow a problem would have concluded the shape made no
+     * difference.
+     */
     unsigned int want_ms = 0, want_count = 0;
+
+    {
+        const char *e = getenv("TINYPOD_ALSA_PERIOD_MS");
+        if (e && *e) want_ms = (unsigned int)strtoul(e, NULL, 10);
+        e = getenv("TINYPOD_ALSA_PERIODS");
+        if (e && *e) want_count = (unsigned int)strtoul(e, NULL, 10);
+
+        /* Nonsense is ignored rather than passed to the driver: a period of
+           zero divides by zero further down, and a thousand periods is not a
+           shape anybody meant to ask for. */
+        if (want_ms > 1000u) want_ms = 0;
+        if (want_count > 64u) want_count = 0;
+    }
     unsigned int i, n = sizeof SHAPES / sizeof SHAPES[0];
     char tried[160] = "";
     char cando[128] = "";
@@ -286,13 +308,44 @@ static struct tp_sink *alsa_open(int rate, int channels, char *err, size_t errsz
             cfg.period_size = period;
             cfg.period_count = count;
             /*
-             * Start with the buffer full rather than half full. Half a buffer
-             * is half the time to the first underrun, and the decoder is at
-             * its slowest at the beginning of a track - the file is being
-             * opened and the first frame parsed while the device is already
-             * playing.
+             * One period, and NOT the whole buffer.
+             *
+             * This asked for the whole buffer, on the reasoning that starting
+             * full buys the most time before the first underrun. On the codec
+             * that worked. On snd-aloop it hung: the stream stayed PREPARED
+             * for ever, one write landed, and the writer spun at ninety per
+             * cent of the CPU with the hardware pointer never moving.
+             *
+             * The reason is in tinyalsa, and it is worth writing down because
+             * it will bite anything else that sets this field. pcm_open reads
+             * the REFINED period size and count back from the driver - the
+             * driver is allowed to change them, and snd-aloop does - but then
+             * computes the buffer from the ones that were ASKED for:
+             *
+             *     pcm->config.period_size  = param_get_int(... PERIOD_SIZE);
+             *     pcm->config.period_count = param_get_int(... PERIODS);
+             *     pcm->buffer_size = config->period_count * config->period_size;
+             *
+             * So pcm->buffer_size can be larger than the buffer that actually
+             * exists. The write path then starts the stream when
+             *
+             *     pcm->buffer_size - avail >= start_threshold
+             *
+             * and with start_threshold equal to that same inflated figure,
+             * the test needs avail to reach zero against a buffer bigger than
+             * the real one. It never can. The stream never starts, nothing
+             * drains, and the next write has nowhere to go.
+             *
+             * One period is reachable whatever the driver refines to, which
+             * is also what tinyalsa defaults to when this field is left zero
+             * and why tinyplay reaches RUNNING on the same loopback.
+             *
+             * The protection against underruns was never really coming from
+             * the threshold anyway - it comes from the buffer being 320 ms
+             * instead of 40 ms, and that is unchanged. All this delayed was
+             * the moment the first sample was allowed out.
              */
-            cfg.start_threshold = period * count;
+            cfg.start_threshold = period;
             cfg.stop_threshold = period * count;
             cfg.silence_threshold = 0;
             cfg.avail_min = period;
