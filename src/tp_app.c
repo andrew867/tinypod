@@ -30,6 +30,17 @@ int tp_app_init(struct tp_app *app, const char *mount, enum tp_player_backend ba
         app->queue.repeat = TP_REPEAT_ALL;
     else
         app->queue.repeat = TP_REPEAT_OFF;
+    /*
+     * The saved output, before the player can open anything.
+     *
+     * Applied here rather than in the sink's own environment handling so that
+     * the stored choice wins over TINYPOD_ALSA_PCM only when there is one -
+     * an empty name leaves the environment in charge, which is what makes the
+     * variable still useful for a one-off from the shell.
+     */
+    if (app->cfg.output[0])
+        tp_sink_set_device(app->cfg.output);
+
     app->player = tp_player_create(backend);
     if (!app->player)
         return -1;

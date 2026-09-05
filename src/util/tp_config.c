@@ -57,11 +57,12 @@ int tp_config_save(const struct tp_config *c)
             "  \"last_track_id\": %llu,\n"
             "  \"last_position_ms\": %u,\n"
             "  \"shuffle\": %s,\n"
-            "  \"repeat\": \"%s\"\n"
+            "  \"repeat\": \"%s\",\n"
+            "  \"output\": \"%s\"\n"
             "}\n",
             c->last_mount ? c->last_mount : "",
             (unsigned long long)c->last_track_id, c->last_position_ms,
-            c->shuffle ? "true" : "false", c->repeat);
+            c->shuffle ? "true" : "false", c->repeat, c->output);
     fclose(f);
     free(path);
     return 0;
@@ -118,6 +119,21 @@ int tp_config_load(struct tp_config *c)
             if (q && (size_t)(q - p - 1) < sizeof(c->repeat)) {
                 memcpy(c->repeat, p + 1, (size_t)(q - p - 1));
                 c->repeat[q - p - 1] = '\0';
+            }
+        }
+    }
+
+    /* Absent in a file written before this existed, which is the ordinary
+       case on an upgrade and not a fault: the empty default means "wherever
+       the build was told at startup". */
+    p = strstr(buf, "\"output\"");
+    if (p) {
+        p = strchr(p + 8, '"');
+        if (p) {
+            char *q = strchr(p + 1, '"');
+            if (q && (size_t)(q - p - 1) < sizeof(c->output)) {
+                memcpy(c->output, p + 1, (size_t)(q - p - 1));
+                c->output[q - p - 1] = '\0';
             }
         }
     }

@@ -9,6 +9,10 @@ struct tp_config {
     uint32_t last_position_ms;
     int shuffle;
     char repeat[16]; /* off|one|all */
+    /* An alsa-lib device name from /etc/asound.conf, or empty for the
+       default. Stored by name rather than as an index so that adding a
+       device to asound.conf cannot silently renumber somebody's choice. */
+    char output[24];
 };
 
 void tp_config_init(struct tp_config *c);

@@ -48,6 +48,26 @@ struct tp_player {
     char *current_path;
     char *current_title;
 
+    /*
+     * The output device, kept open across tracks.
+     *
+     * There is one decode thread per track, so a sink opened inside it was
+     * closed and reopened at every track change - and on this hardware that
+     * is not free. The codec takes a 60 ms rate-change settle inside its
+     * play-start, so every gap carried an audible pause that had nothing to do
+     * with decoding. Through the Bluetooth tee it is worse: closing the PCM
+     * tears down the fifo leg, so the far end hears the link drop and
+     * reconnect between tracks.
+     *
+     * Reopened only when the format actually changes. Two 44.1 kHz stereo
+     * tracks in a row keep the same stream; a 48 kHz track after a 44.1 kHz
+     * one does not, because the rate is a property of the open device.
+     */
+    struct tp_sink *sink;
+    int sink_rate;
+    int sink_channels;
+    int sink_stale;     /* the destination changed; reopen at the next track */
+
     /* internal decode thread */
     int async;          /* caller will notice failures itself */
     pthread_t thread;
@@ -160,6 +180,55 @@ static void stop_thread(struct tp_player *p)
     pthread_mutex_unlock(&p->lock);
 }
 
+/*
+ * The sink for this track: the one already open, or a new one.
+ *
+ * Called only from the decode thread, and there is only ever one of those -
+ * stop_thread joins the previous before the next is created - so the cached
+ * pointer needs no lock of its own.
+ */
+static struct tp_sink *sink_acquire(struct tp_player *p, int rate, int channels,
+                                    char *err, size_t errsz)
+{
+    int stale;
+
+    pthread_mutex_lock(&p->lock);
+    stale = p->sink_stale;
+    p->sink_stale = 0;
+    pthread_mutex_unlock(&p->lock);
+
+    if (p->sink) {
+        if (!stale && p->sink_rate == rate && p->sink_channels == channels)
+            return p->sink;
+
+        /* A different format needs a different stream. Play out what is
+           queued first, so the change does not cut the previous track. */
+        tp_sink_drain(p->sink);
+        tp_sink_close(p->sink);
+        p->sink = NULL;
+    }
+
+    p->sink = tp_sink_open(rate, channels, err, errsz);
+    if (p->sink) {
+        p->sink_rate = rate;
+        p->sink_channels = channels;
+    }
+    return p->sink;
+}
+
+/* Give the device back. Called when the player is torn down, not between
+   tracks - holding it open is the entire point. */
+static void sink_release(struct tp_player *p)
+{
+    if (!p->sink)
+        return;
+    tp_sink_drain(p->sink);
+    tp_sink_close(p->sink);
+    p->sink = NULL;
+    p->sink_rate = 0;
+    p->sink_channels = 0;
+}
+
 static void *play_thread(void *arg)
 {
     struct tp_player *p = arg;
@@ -186,7 +255,8 @@ static void *play_thread(void *arg)
     if (!dec)
         goto done;
 
-    sink = tp_sink_open(tp_dec_rate(dec), tp_dec_channels(dec), err, sizeof(err));
+    sink = sink_acquire(p, tp_dec_rate(dec), tp_dec_channels(dec),
+                        err, sizeof(err));
     if (!sink)
         goto done;
 
@@ -281,10 +351,13 @@ static void *play_thread(void *arg)
     }
 
 done:
-    if (sink) {
+    /*
+     * Drained but NOT closed. The tail of this track is played out, and the
+     * device stays open for the next one - which is the whole point, and why
+     * tp_sink_drain leaves the stream prepared rather than merely stopped.
+     */
+    if (sink)
         tp_sink_drain(sink);
-        tp_sink_close(sink);
-    }
     if (dec)
         tp_dec_close(dec);
     free(block);
@@ -381,11 +454,30 @@ static int play_internal(struct tp_player *p, const char *path)
     return 0;
 }
 
+void tp_player_set_output(struct tp_player *p, const char *pcm)
+{
+    if (!p)
+        return;
+
+    tp_sink_set_device(pcm);
+
+    /*
+     * Only the cached handle is dropped, and only when nothing is using it.
+     * The decode thread owns that pointer while it runs, so this marks it
+     * instead and lets the thread reopen at the next track - which is the
+     * seam where a gap is expected anyway.
+     */
+    pthread_mutex_lock(&p->lock);
+    p->sink_stale = 1;
+    pthread_mutex_unlock(&p->lock);
+}
+
 void tp_player_destroy(struct tp_player *p)
 {
     if (!p)
         return;
     stop_thread(p);
+    sink_release(p);        /* after the thread has gone, never during */
     kill_child(p);
     free(p->current_path);
     free(p->current_title);

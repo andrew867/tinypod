@@ -40,6 +40,17 @@ struct tp_player;
 struct tp_player *tp_player_create(enum tp_player_backend backend);
 void tp_player_destroy(struct tp_player *p);
 
+/*
+ * Send the audio somewhere else.
+ *
+ * Safe while playing: the cached device is closed and the next track opens
+ * the new one. It does not move the track that is already sounding, because a
+ * PCM's destination is decided when it is opened - and switching mid-track
+ * would mean a gap either way, so it happens at the seam where one is
+ * expected.
+ */
+void tp_player_set_output(struct tp_player *p, const char *pcm);
+
 int tp_player_play_track(struct tp_player *p, const struct tp_track *t);
 int tp_player_play_file(struct tp_player *p, const char *path);
 int tp_player_pause(struct tp_player *p);

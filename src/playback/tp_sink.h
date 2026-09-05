@@ -73,6 +73,20 @@ void tp_sink_flush(struct tp_sink *s);
 
 void tp_sink_close(struct tp_sink *s);
 
+/*
+ * Where the next sink opens: an alsa-lib device name, or NULL for the card and
+ * device numbers.
+ *
+ * Takes effect at the next open rather than immediately - a PCM's destination
+ * is fixed when it is opened, so moving the audio means a new stream. The
+ * player closes its cached one when this changes.
+ *
+ * The names come from /etc/asound.conf on the device and nothing here knows
+ * what they mean; the routing is the machine's business.
+ */
+void tp_sink_set_device(const char *pcm);
+const char *tp_sink_get_device(void);
+
 /* Whether this build can output audio at all. */
 int tp_sink_available(void);
 

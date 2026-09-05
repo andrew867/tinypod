@@ -16,6 +16,8 @@
 #include "tp_lv_screens.h"
 #include "tp_lv_input.h"
 #include "tp_volume.h"
+#include "tp_sink.h"
+#include "tp_player.h"
 #include "tp_badfile.h"
 #include "backlight.h"
 #include "status.h"
@@ -687,8 +689,43 @@ static void fill_tracks(int i, struct tp_lv_row *out, void *ctx)
 #define S_BACKEND 3
 #define S_LIBRARY 4
 #define S_HIDDEN  5
-#define S_STOP    6
-#define SETTINGS_N 7
+#define S_OUTPUT  6
+#define S_STOP    7
+#define SETTINGS_N 8
+
+/*
+ * Where the audio goes.
+ *
+ * These are plugin names from /etc/asound.conf on the device, not cards: the
+ * rate conversion, the per-output softvol control and the tee that feeds the
+ * headphones and the Bluetooth fifo at once are all plugins, and none of them
+ * has a card number. An empty name means whatever the build was told at
+ * startup, which is the right default for a machine whose asound.conf might
+ * not have any of this in it.
+ *
+ * "Both" is a tee rather than two streams, so the pair shares one level. Two
+ * separate levels would need two writers, which is a different feature.
+ */
+static const struct { const char *pcm, *label; } k_outputs[] = {
+    { "",        "Default" },
+    { "n31hp",   "Headphones" },
+    { "n31bt",   "Bluetooth" },
+    { "n31both", "Both" },
+};
+#define OUTPUTS_N ((int)(sizeof k_outputs / sizeof k_outputs[0]))
+
+static const char *output_label(const char *pcm)
+{
+    int i;
+
+    for (i = 0; i < OUTPUTS_N; i++)
+        if (strcmp(k_outputs[i].pcm, pcm ? pcm : "") == 0)
+            return k_outputs[i].label;
+
+    /* Something set by hand through the environment. Shown as itself rather
+       than as "Default", which would be a lie about where the sound is. */
+    return (pcm && *pcm) ? pcm : "Default";
+}
 
 /*
  * The running order, as it will actually play.
@@ -786,6 +823,13 @@ static void fill_settings(int i, struct tp_lv_row *out, void *ctx)
         out->line2 = v[1];
         break;
     }
+    case S_OUTPUT:
+        out->line1 = "Output";
+        snprintf(v[2], sizeof v[2], "%s%s",
+                 output_label(tp_sink_get_device()),
+                 tp_sink_available() ? "" : "  (no audio device)");
+        out->line2 = v[2];
+        break;
     case 4:
         out->line1 = "Library source";
         snprintf(v[2], sizeof v[2], "%zu tracks", app->lib.track_count);
@@ -1258,6 +1302,26 @@ static void activate(void)
             s_ui.show_hidden = !s_ui.show_hidden;
             if (s_ui.browse_path[0])
                 browse_load();
+        } else if (v->sel == S_OUTPUT) {
+            /*
+             * Cycle to the next destination and remember it.
+             *
+             * The change lands at the next track rather than at once: a PCM's
+             * destination is fixed when it is opened, so moving the audio is a
+             * new stream either way, and the track seam is where a gap is
+             * already expected.
+             */
+            const char *now = tp_sink_get_device();
+            int i, at = 0;
+
+            for (i = 0; i < OUTPUTS_N; i++)
+                if (strcmp(k_outputs[i].pcm, now ? now : "") == 0) at = i;
+
+            at = (at + 1) % OUTPUTS_N;
+            tp_player_set_output(app->player, k_outputs[at].pcm);
+            snprintf(app->cfg.output, sizeof app->cfg.output, "%s",
+                     k_outputs[at].pcm);
+            tp_config_save(&app->cfg);
         } else if (v->sel == S_STOP) {
             tp_app_cmd_stop(app);
             s_ui.was_playing = 0;

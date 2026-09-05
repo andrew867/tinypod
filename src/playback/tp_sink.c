@@ -96,6 +96,16 @@ struct pcm {
     int ready;
 };
 
+/*
+ * The device to open, when it is a name rather than a pair of numbers.
+ *
+ * File scope because pcm_open keeps tinyalsa's signature - the whole point of
+ * this shim is that the thousand lines below it never learn which library
+ * they are talking to, and giving it an extra parameter would defeat that.
+ * Set once from the environment before the first open.
+ */
+static char s_pcm_name[64];
+
 /* The capability line on the error path. alsa-lib answers this from the
    refined hardware parameters rather than from a static range. */
 struct pcm_params { unsigned int rmin, rmax, cmin, cmax; };
@@ -103,7 +113,7 @@ struct pcm_params { unsigned int rmin, rmax, cmin, cmax; };
 static struct pcm_params *pcm_params_get(unsigned int card, unsigned int device,
                                          unsigned int flags)
 {
-    char name[32];
+    char name[sizeof s_pcm_name];
     snd_pcm_hw_params_t *hw = 0;
     snd_pcm_t *h = 0;
     struct pcm_params *p;
@@ -146,7 +156,7 @@ static void pcm_params_free(struct pcm_params *p) { free(p); }
 static struct pcm *pcm_open(unsigned int card, unsigned int device,
                             unsigned int flags, struct pcm_config *cfg)
 {
-    char name[32];
+    char name[sizeof s_pcm_name];
     struct pcm *s;
     unsigned int us;
     int rc;
@@ -155,7 +165,21 @@ static struct pcm *pcm_open(unsigned int card, unsigned int device,
     s = calloc(1, sizeof *s);
     if (!s) return 0;
 
-    snprintf(name, sizeof name, "hw:%u,%u", card, device);
+    /*
+     * A name if one was given, and hw:C,D otherwise.
+     *
+     * hw:C,D can only ever be a card and a device on it. Everything
+     * interesting on this machine is a plugin: the rate conversion that has to
+     * sit ABOVE the tee rather than below it, the softvol that gives each
+     * output its own mixer control, and the tee itself that feeds the
+     * headphones and a fifo for Bluetooth at the same time. None of those has
+     * a card number, so with two integers as the only way to say where the
+     * audio goes, none of them was reachable.
+     */
+    if (s_pcm_name[0])
+        snprintf(name, sizeof name, "%s", s_pcm_name);
+    else
+        snprintf(name, sizeof name, "hw:%u,%u", card, device);
     if (snd_pcm_open(&s->h, name, SND_PCM_STREAM_PLAYBACK, 0) < 0) {
         s->h = 0;
         return s;                       /* not ready; the caller reports it */
@@ -329,6 +353,27 @@ static void fail(char *err, size_t errsz, const char *fmt, ...)
     va_end(ap);
 }
 
+void tp_sink_set_device(const char *pcm)
+{
+#ifdef TINYPOD_HAVE_ALSALIB
+    if (pcm && *pcm)
+        snprintf(s_pcm_name, sizeof s_pcm_name, "%s", pcm);
+    else
+        s_pcm_name[0] = 0;
+#else
+    (void)pcm;
+#endif
+}
+
+const char *tp_sink_get_device(void)
+{
+#ifdef TINYPOD_HAVE_ALSALIB
+    return s_pcm_name[0] ? s_pcm_name : "";
+#else
+    return "";
+#endif
+}
+
 int tp_sink_available(void)
 {
 #if defined(TINYPOD_HAVE_ALSA) || defined(TINYPOD_HAVE_OSS)
@@ -363,6 +408,23 @@ static struct tp_sink *alsa_open(int rate, int channels, char *err, size_t errsz
 
     if ((e = getenv("TINYPOD_ALSA_CARD")) != NULL)
         card = (unsigned int)strtoul(e, NULL, 10);
+    /*
+     * TINYPOD_ALSA_PCM names an alsa-lib device outright and wins over the
+     * card and device numbers, which cannot name a plugin.
+     *
+     *   TINYPOD_ALSA_PCM=n31hp     headphones
+     *   TINYPOD_ALSA_PCM=n31bt     Bluetooth
+     *   TINYPOD_ALSA_PCM=n31both   both at once, through the tee
+     *
+     * Those come from /etc/asound.conf on the device. Nothing here knows what
+     * they mean, which is the point: the routing is the machine's business and
+     * this only has to be able to say a name.
+     */
+#ifdef TINYPOD_HAVE_ALSALIB
+    if ((e = getenv("TINYPOD_ALSA_PCM")) != NULL && *e)
+        snprintf(s_pcm_name, sizeof s_pcm_name, "%s", e);
+#endif
+
     if ((e = getenv("TINYPOD_ALSA_DEVICE")) != NULL)
         device = (unsigned int)strtoul(e, NULL, 10);
 
