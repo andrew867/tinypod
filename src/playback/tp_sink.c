@@ -29,7 +29,16 @@ int pcm_state(struct pcm *pcm);
 #endif
 
 #ifdef TINYPOD_HAVE_ALSALIB
+/*
+ * alsa-lib's pcm.h declares a zero-length array, which -Wpedantic rejects.
+ * It is a third-party header and not ours to correct, so the warning is
+ * suppressed for the include and restored immediately after: every line of
+ * this file is still held to the same standard as the rest of the tree.
+ */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 #include <alsa/asoundlib.h>
+#pragma GCC diagnostic pop
 
 /*
  * alsa-lib, wearing tinyalsa's interface.

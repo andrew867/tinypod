@@ -33,10 +33,31 @@ TP="$HERE/third_party"
 SRC="$TP/ffmpeg-$VER"
 CROSS="${CROSS:-}"
 
+# The core, the FPU and the ABI, in one place.
+#
+# These said cortex-a8 and vfpv3-d16, which the Cortex-A5 correction missed:
+# /proc/cpuinfo reports CPU part 0xc05 with vfpv4 and vfpd32, so this was
+# tuning for a dual-issue pipeline the part does not have and holding the
+# compiler to half the double registers it does have.
+#
+# FLOAT_ABI is overridable for the hard-float tree. softfp is not soft float -
+# the FPU does the arithmetic either way and only argument passing differs -
+# but hard float needs the whole parallel toolchain, so it cannot simply be
+# switched on here.
+FLOAT_ABI="${FLOAT_ABI:-softfp}"
+ARCH_CFLAGS="-mcpu=cortex-a5 -mfpu=vfpv4 -mfloat-abi=$FLOAT_ABI"
+
+# The tag names the ABI as well as the target, because a hard-float build is a
+# different library and not a newer one. Overridable so both can exist:
+#
+#   CROSS=<hf prefix> TAG=n31hf FLOAT_ABI=hard ./tools/fetch-<x>.sh
+#
+# Without that they share a directory and the second build silently becomes
+# the one everything links against.
 if [ -n "$CROSS" ]; then
-	TAG=n31
+	TAG="${TAG:-n31}"
 else
-	TAG=host
+	TAG="${TAG:-host}"
 fi
 OUT="$TP/ffmpeg-build/$TAG"
 
@@ -114,8 +135,8 @@ if [ ! -f config.h ]; then
 		"$SRC/configure" "${COMMON[@]}" \
 			--enable-cross-compile \
 			--cross-prefix="$CROSS" \
-			--arch=arm --cpu=cortex-a8 --target-os=linux \
-			--extra-cflags="-mfpu=vfpv3-d16 -mfloat-abi=softfp -Os -fPIC" \
+			--arch=arm --cpu=cortex-a5 --target-os=linux \
+			--extra-cflags="$ARCH_CFLAGS -Os -fPIC" \
 			--extra-ldflags="-static" \
 			--disable-neon \
 			--prefix="$OUT"
